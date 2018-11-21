@@ -1,0 +1,2527 @@
+---
+title: "Integrative multiomic profiling reveals epigenetic precoding, transcription factor hierarchies and reprogrammability of the senescent state"
+subtitle: "Appendix C : Analyses of ATAC-seq data"
+date: ""
+
+output:
+   BiocStyle::html_document:
+    theme: cosmo
+    highlight:  "tango"
+    toc: true
+    toc_float:
+      toc_collapsed: true
+    toc_depth: 2
+    number_sections: true
+    code_folding: 'show'
+    df_print: paged
+abstract: |
+---
+  
+  \pagebreak
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE, cache.lazy = FALSE, eval = TRUE, results = "hide", message = FALSE, warning = FALSE, echo = TRUE, fig.wide = TRUE,  fig.align='center', cache.comments = FALSE)
+```
+
+# Overview of the data
+
+The table below summarize the information relative to the histone modification ATAC-seq data anlyzed in the scope of this study. The information given are :
+  
+* *Time point* : T0 - before induction of RAS, or 24h-48h-72h-96h-144h after induction,
+* *Replicate* : there are three replicates per time-point,
+* *SRA* : Sequence Read Archive accession number,
+* *Raw reads* : total number of reads for each library before any processing,
+* *Clean reads* : number of reads remaining after quality filtering and adapter triming,
+* *Uniquely mapped* : number of unambiguously mapped reads,
+* *Non duplicated* : number of reads after filter for PCR / optical duplicates,
+* *Not in BLR* : number of reads mapped outside hg19 ENCODE blacklisted regions (BLR),
+* *% kept* : percentage of reads kept for subsequent analysis after filtering,
+* *% duplicates* : percentage of PCR / optical duplicates,
+* *% BLR* : percentage of reads mapped in BLR,
+* *% chrM* : percentage of reads mapped on mitochondrial chromosome.
+
+```{r, results= "asis", echo = FALSE}
+library(dplyr)
+library(knitr)
+library(kableExtra)
+info_atacseq <- read.table("./data/ATAC-seq/ATAC-seq_data_info.txt", header = TRUE, sep = "\t")
+
+kable(info_atacseq,
+      col.names = c("Time point", "Replicate", "SRA",
+                    "Raw reads (N)", "Clean reads (N)", "Uniquely mapped (N)",
+                    "Non duplicated (N)", "Not in BLR (N)", "% kept",
+                    "% duplicates", "% in BLR", "% chrM")) %>%
+  kable_styling("striped", full_width = TRUE, font_size = 9, position = "left") %>%
+  collapse_rows(columns = 1:2, valign = "top")
+
+```
+
+
+# Preprocessing of ATAC-seq
+
+All the ATAC-seq data were processed using a workflow written in *bash* and ran on a Unix cluster driven by Sun Gride Engine. The different steps we described bellow are :
+
+* quality check on raw reads with [fastQC 0.11.5](https://www.bioinformatics.babraham.ac.uk/projects/fastqc/),
+* read croping with [trimmomatic 0.33](http://www.usadellab.org/cms/?page=trimmomatic)
+* read trimming and cleaning with [cutadapt 1.9.1](https://github.com/marcelm/cutadapt),
+* check for contaminations with [fastq-screen 0.4.4](https://www.bioinformatics.babraham.ac.uk/projects/fastq_screen/),
+* alignment with [bowtie2 2.2.3](http://bowtie-bio.sourceforge.net/bowtie2/index.shtml),
+* de-duplication with [PicardTools 1.130](https://broadinstitute.github.io/picard/),
+* filtering of reads aligned in [Encode blaclisted regions](https://sites.google.com/site/anshulkundaje/projects/blacklists) with [bedtools 2.19.1](http://bedtools.readthedocs.io/en/latest/),
+* sorting and filtering of alignments with [samtools 1.6](http://samtools.sourceforge.net),
+* peak calling with [MACS 2.1.0](https://github.com/taoliu/MACS),
+* irreproducible discovery rate computation with [idr](https://sites.google.com/site/anshulkundaje/projects/idr).
+
+Briefly, in this workflow, paired-ends reads were cropped to 100bp with trimmomatic v0.36 and cleaned using cutadapt v1.8.3 to remove Nextera adapters, low quality bases and reads, and discard reads shorter than 25 bp after filtering. Fragments were then aligned to the human reference genome (hg19) using bowtie2 v2.2.3 discarding inconsistent pairs and considering a maximum insert size of 2kb (bowtie2 -N 0 --no-mixed --no-discordant --minins 30 --maxins 2000). Alignment files were further processed with samtools v1.2 and PicardTools v1.130 to flag PCR and optical duplicates and remove alignments located in Encode blacklisted regions. Accessible regions were identified using MACS2 v2.1.0 without control (macs2 callpeak --gsize hs -p 1e-3). These relaxed peak lists were then processed through the irreproducible discovery rate (IDR) pipeline to generate an optimal and reproducible set of peaks for each time point.
+
+## Preparing the working environment 
+
+```{bash,  eval = FALSE}
+##--> Create main directories
+mkdir ./Data/
+mkdir ./Output/
+mkdir ./Scripts/
+mkdir ./Std_Output/
+
+##--> Create subdirectories
+mkdir -p ./Data/0-Raw-Fastq/
+mkdir -p ./Data/0-TRIMMED_Fastq/
+mkdir -p ./Data/1-DEDUP_Bam/
+mkdir -p ./Data/1-MAPPING_Bam/
+mkdir -p ./Data/1-NOBLACKLIST_Bam/
+
+mkdir -p ./Output/0-CONTAMINATION/
+mkdir -p ./Output/0-FAST-QC/
+mkdir -p ./Output/3-NucleoATAC/
+
+mkdir -p ./Std_Output/0-FastqCUT/
+mkdir -p ./Std_Output/0-FastqMCF/
+mkdir -p ./Std_Output/0-FastqScreen/
+mkdir -p ./Std_Output/1-Bowtie/
+mkdir -p ./Std_Output/1-Sort/
+mkdir -p ./Std_Output/1-Markdup/
+mkdir -p ./Std_Output/1-Dedup/
+mkdir -p ./Std_Output/1-NoBL_Dedup/
+mkdir -p ./Std_Output/3-MACS2/
+```
+
+## QC on row data 
+
+```{bash, eval = FALSE}
+##--> Run fastQC on all samples 
+for i in $(ls --color=never ./Data/0-Raw-Fastq/)
+do
+    qsub -q ono -cwd -V -l mem_rsvd=8G -b y fastqc --nogroup ./Data/0-Raw-Fastq/$i
+done
+
+##--> Move outputs
+mv ./Data/0-Raw-Fastq/*fastqc* ./Output/0-FAST-QC/
+
+```
+
+## Apdapters cleaning, read triming and filtering
+
+```{bash, eval = FALSE}
+##--> Creation of batch script : crop to 100 bp
+for i in $(ls --color=never ./Data/0-Raw-Fastq/ | grep "fastq.gz$" | sed 's/_S[12]//g' |sed 's/.fastq.gz//g' | sort -u)
+do
+    echo "java -jar trimmomatic-0.35.jar \
+            PE \
+            ./Data/0-Raw-Fastq/"$i"_S1.fastq.gz \
+            ./Data/0-Raw-Fastq/"$i"_S2.fastq.gz \
+            ./Data/0-TRIMMED_Fastq/"$i"_S1_TRIMMED.fastq.gz \
+            ./Data/0-TRIMMED_Fastq/"$i"_S1_TRIMMED.fastq.gz.trash \
+            ./Data/0-TRIMMED_Fastq/"$i"_S2_TRIMMED.fastq.gz \
+            ./Data/0-TRIMMED_Fastq/"$i"_S2_TRIMMED.fastq.gz.trash \
+            CROP:100" \
+            >> ./Scripts/FASTQ-TRIMMOMATIC.txt
+done
+
+##--> Run the analysis
+qarray \
+    -q ono \
+    -cwd \
+    -V \
+    -N FastqTRIMMO \
+    -e ./Std_Output/0-FastqCUT/ \
+    -o ./Std_Output/0-FastqCUT/ \
+    ./Scripts/FASTQ-TRIMMOMATIC.txt
+            
+
+##--> Creation of batch script : Triming / Cleaning
+for i in $(ls --color=never ./Data/0-Raw-Fastq/ | grep "fastq.gz$" | sed 's/_S[12]//g' |sed 's/.fastq.gz//g' | sort -u)
+do
+    echo "cutadapt \
+            --overlap 10 \
+            -q 30,30 \
+            -n 3 \
+            -a NNCTGTCTCTTATACACATCT \
+            -A NNCTGTCTCTTATACACATCT \
+            -g AGATGTGTATAAGAGACAG \
+            -g CCGGCACATCTCCGAGCCCACGAGACNNNNNNNNATCTCGTATGCCGTCTTCTGCTTG \
+            -G CCGGCACATCTCCGAGCCCACGAGACNNNNNNNNATCTCGTATGCCGTCTTCTGCTTG \
+            -G AGATGTGTATAAGAGACAG \
+            -m 25 \
+            -o ./Data/0-TRIMMED_Fastq/"$i"_S1_TRIMMED_1.fastq.gz \
+            -p ./Data/0-TRIMMED_Fastq/"$i"_S2_TRIMMED_1.fastq.gz \
+            ./Data/0-TRIMMED_Fastq/"$i"_S1_TRIMMED.fastq.gz \
+            ./Data/0-TRIMMED_Fastq/"$i"_S2_TRIMMED.fastq.gz" \
+    >> ./Scripts/FASTQ-CUTADAPT.txt
+done
+
+##--> Run the analysis
+qarray \
+    -q ono \
+    -cwd \
+    -V \
+    -N FastqCUT \
+    -e ./Std_Output/0-FastqCUT/ \
+    -o ./Std_Output/0-FastqCUT/ \
+    ./Scripts/FASTQ-CUTADAPT.txt
+
+##--> Creation of batch script :
+## Remove 6 extra bp to avoid Bowtie2 issue with doved read (biased fragment length distribution)
+
+for i in $(ls --color=never ./Data/0-Raw-Fastq/ | grep "fastq.gz$" | sed 's/_S[12]//g' |sed 's/.fastq.gz//g' | sort -u)
+do
+    echo "cutadapt \
+            -u -20 -U -20 -m 25 \
+            -o ./Data/0-TRIMMED_Fastq/"$i"_S1_TRIMMED_2.fastq.gz \
+            -p ./Data/0-TRIMMED_Fastq/"$i"_S2_TRIMMED_2.fastq.gz \
+            ./Data/0-TRIMMED_Fastq/"$i"_S1_TRIMMED_1.fastq.gz \
+            ./Data/0-TRIMMED_Fastq/"$i"_S2_TRIMMED_1.fastq.gz" \
+    >> ./Scripts/FASTQ-CUTADAPT_2.txt
+done
+
+##--> Run the analysis
+qarray \
+    -q ono \
+    -cwd \
+    -V \
+    -N FastqCUT_2 \
+    -e ./Std_Output/0-FastqCUT/ \
+    -o ./Std_Output/0-FastqCUT/ \
+    ./Scripts/FASTQ-CUTADAPT_2.txt
+
+for i in $(ls --color=never ./Data/0-Raw-Fastq/ | grep "fastq.gz$" | sed 's/_S[12]//g' |sed 's/.fastq.gz//g' | sort -u)
+do
+    mv ./Data/0-TRIMMED_Fastq/"$i"_S1_TRIMMED_2.fastq.gz ./Data/0-TRIMMED_Fastq/"$i"_S1_TRIMMED.fastq.gz
+    mv ./Data/0-TRIMMED_Fastq/"$i"_S2_TRIMMED_2.fastq.gz ./Data/0-TRIMMED_Fastq/"$i"_S2_TRIMMED.fastq.gz
+    rm ./Data/0-TRIMMED_Fastq/"$i"_S1_TRIMMED_1.fastq.gz
+    rm ./Data/0-TRIMMED_Fastq/"$i"_S2_TRIMMED_1.fastq.gz
+done
+
+##--> Run fastqc on Trimmed reads
+for i in $(ls --color=never ./Data/0-TRIMMED_Fastq/)
+do
+    qsub -q ono -cwd -V -l mem_rsvd=8G -b y fastqc  --nogroup ./Data/0-TRIMMED_Fastq/$i
+done
+
+mv ./Data/0-TRIMMED_Fastq/*fastqc* ./Output/0-FAST-QC/
+
+```
+
+## Check for contamination
+
+```{bash, eval = FALSE}
+##--> Creation of batch script
+for i in $(ls --color=never ./Data/0-Raw-Fastq/ | grep "fastq.gz$" | sed 's/\.fastq.gz//g')
+do
+    rm ./Output/0-CONTAMINATION/"$i"_TRIMMED_screen.txt
+    echo fastq_screen                                          `# Version: 0.4.4` \
+        --subset 300000                                        `# Number of reads for subsampling` \
+        --outdir ./Output/0-CONTAMINATION/                     `# Output directory` \
+        --aligner bowtie2                                      `# Aligner used (bowtie or bowtie2)` \
+        --threads 4                                            `# Number of threads` \
+       ./Data/0-TRIMMED_Fastq/"$i"_TRIMMED.fastq.gz \
+    >> ./Scripts/FASTQ-SCREEN.txt
+done
+
+##--> Run the analysis
+qarray \
+    -q ono \
+    -pe thread 4 \
+    -cwd \
+    -V \
+    -N FastqScreen \
+    -e ./Std_Output/0-FastqScreen/ \
+    -o ./Std_Output/0-FastqScreen/ \
+    ./Scripts/FASTQ-SCREEN.txt
+```
+
+## Alignment
+
+```{bash, eval = FALSE}
+
+# Creation of batch script
+for i in $(ls --color=never ./Data/0-Raw-Fastq/ | grep "fastq.gz$" | sed 's/_S[12]//g' |sed 's/.fastq.gz//g' | sort -u)
+do
+    echo bowtie2                                                    `# Version: 2.2.3`\
+        -p 8                                                         `# Number of threads`\
+        -N 0                                                         `# Number of mismatches in the seed`\
+        --no-mixed                                                   `# Only consider pairs`\
+        --no-discordant                                              `# Don't consider discordant pairs`\
+        --maxins 2000                                                `# Max insert size`\
+        -x /local/databases/index/bowtie/hg19/2.1.0/hg19.fa          `# Reference index`\
+        -1 ./Data/0-TRIMMED_Fastq/"$i"_S1_TRIMMED.fastq              `# Input S1`\
+        -2 ./Data/0-TRIMMED_Fastq/"$i"_S2_TRIMMED.fastq              `# Input S2`\
+        --trim3 8 \
+    | samtools view -Sb - > ./Data/1-MAPPING_Bam/"$i".bam           `# Conversion sam to bam with samtools`\
+>> ./Scripts/BOWTIE.txt
+done
+
+# Run the analysis
+qarray \s
+    -q ono \
+    -cwd \
+    -V \
+    -pe thread 8 \
+    -N BOWTIE \
+    -e ./Std_Output/1-Bowtie/ \
+    -o ./Std_Output/1-Bowtie/ \
+    ./Scripts/BOWTIE.txt
+```
+
+## Sorting
+
+```{bash, eval = FALSE}
+##--> Creation of batch script
+for i in $(ls --color=never ./Data/0-TRIMMED_Fastq/ | grep "fastq$" | sed 's/_S[12]_TRIMMED_2.fastq//g' | sort -u)
+do
+    echo samtools sort -@ 8 ./Data/1-MAPPING_Bam/"$i".bam ./Data/1-MAPPING_Bam/"$i"_SORT \
+    >> ./Scripts/SAMTOOLS_SORT.txt
+done
+
+##--> Run the analysis        
+qarray \
+    -q ono \
+    -cwd \
+    -V \
+    -pe thread 4 \
+    -N Sort \
+    -e ./Std_Output/1-Sort/ \
+    -o ./Std_Output/1-Sort/ \
+    ./Scripts/SAMTOOLS_SORT.txt
+
+```
+
+## De-duplication
+
+```{bash, eval = FALSE}
+# Creation of batch script
+for i in $(ls --color=never ./Data/0-Raw-Fastq/ | grep "fastq.gz$" | sed 's/\.fastq.gz//g'|sed 's/\_S[12]//g' | sort -u)
+do
+    echo java -jar -Xmx16g ~/bin/Tools/PicardTools_v1.130/picard.jar \
+        MarkDuplicates \
+        REMOVE_DUPLICATES=FALSE \
+        METRICS_FILE=./Data/1-DEDUP_Bam/"$i"_MARKDUP.txt \
+        INPUT=./Data/1-MAPPING_Bam/"$i"_SORT.bam \
+        OUTPUT=./Data/1-DEDUP_Bam/"$i"_MARKDUP.bam \
+    >> ./Scripts/MARKDUP.txt
+done
+
+# Run the analysis        
+qarray \
+    -q ono \
+    -cwd \
+    -l mem_rsvd=16G \
+    -V \
+    -N Markdup \
+    -e ./Std_Output/1-Markdup/ \
+    -o ./Std_Output/1-Markdup/ \
+    ./Scripts/MARKDUP.txt
+
+```
+
+## Blacklisted regions
+
+```{bash, eval = FALSE}
+##--> Creation of batch script
+for i in $(ls --color=never ./Data/1-DEDUP_Bam/ | grep "bam$" | sed 's/\_MARKDUP.bam$//g'| sort -u |grep Rep[123])
+do
+    echo " samtools sort -@ 8 -n -o ./Data/1-DEDUP_Bam/"$i"_MARKDUP.bam ./Data/1-DEDUP_Bam/"$i"_MARKDUP.tmp | \
+           pairToBed \
+                -type neither \
+                -abam stdin \
+                -b ~/save/Outils/consensusBlacklist_hg19.bed \
+            > ./Data/1-NOBLACKLIST_Bam/"$i"_DEDUP_NOBLACKLIST.bam" \
+     >> ./Scripts/NOBLACKLIST_DEDUP.txt
+done
+
+
+##--> Run the analysis
+qarray \
+    -pe thread 8 \
+    -q ono \
+    -cwd \
+    -V \
+    -N NoBL_Dedup \
+    -e ./Std_Output/1-NoBL_Dedup/ \
+    -o ./Std_Output/1-NoBL_Dedup/ \
+    ./Scripts/NOBLACKLIST_DEDUP.txt
+```
+
+## Final sorting and indexation
+
+```{bash, eval = FALSE}
+##--> Creation of batch script
+for i in $(ls --color=never ./Data/1-DEDUP_Bam/ | grep "bam$" | sed 's/\_MARKDUP.bam$//g'| sort -u |grep Rep[123])
+do
+    echo "samtools view -h -F 1548 -q 30 ./Data/1-NOBLACKLIST_Bam/"$i"_DEDUP_NOBLACKLIST.bam \
+    | samtools view -hSb - \
+    | samtools sort -@ 8 - ./Data/1-NOBLACKLIST_Bam/"$i"_DEDUP_NOBLACKLIST_SORT" \
+    >> ./Scripts/SAMTOOLS_SORT_2.txt
+done
+
+##--> Run the analysis        
+qarray \
+    -q ono \
+    -cwd \
+    -V \
+    -pe thread 8 \
+    -N Sort \
+    -e ./Std_Output/1-Sort/ \
+    -o ./Std_Output/1-Sort/ \
+    ./Scripts/SAMTOOLS_SORT_2.txt
+
+
+for i in $(ls --color=never ./Data/0-Raw-Fastq/ | grep "fastq.gz$" | sed 's/\.fastq.gz//g'|sed 's/\_S[12]//g' | sort -u)
+do
+    qsub -q ono -cwd -V -b y samtools index ./Data/1-NOBLACKLIST_Bam/"$i"_DEDUP_NOBLACKLIST_SORT.bam
+done
+```    
+
+## Peak calling
+
+### Parameters
+
+```{bash, eval = FALSE}
+marks=(ATAC)
+days=(D0 D1 D2 D3 D4 D6)
+reps=(Rep2 Rep3)
+genomeFile=/local/databases/index/samtools/hg19/0.1.19/hg19.fa
+pvalPeaks=1e-3
+```
+
+
+### Peak calling on original replicates
+
+```{bash, eval = FALSE}
+##--> Creation of batch script 
+for i in $(ls --color=never ./Data/0-Raw-Fastq/ | grep "fastq.gz$" | sed 's/_S[12]\.fastq.gz//g' |sort -u)
+do
+    echo "macs2 callpeak callpeak \
+        --format BAMPE \
+        --gsize hs \
+        -n ./Data/3-PEAK-CALLING/MACS/FRAG_100/SHARP/"$i"_MACS2_FRAG_100_SHARP \
+        --gsize hs \
+        -p 1e-3 \
+        --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/"$i"_DEDUP_NOBLACKLIST_SORT.bam" \
+    >> ./Scripts/MACS2_FRAG_100_SHARP.txt
+done
+
+##--> Run the analysis
+qarray \
+    -q ono \
+    -cwd \
+    -V \
+    -N MACS2 \
+    -l mem_rsvd=16G \
+    -e ./Std_Output/3-MACS2/ \
+    -o ./Std_Output/3-MACS2/ \
+    ./Scripts/MACS2_FRAG_100_SHARP.txt
+```
+
+### Peaks calling on pseudoreplicates of individual replicates
+
+```{bash, eval = FALSE}
+##--> STEP 1.1 : Count the number of alignments in the each replicated .bam and split them in 2 .bam
+
+# Creation of batch script
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+  for rep in ${reps[@]} ; do
+     
+     echo "\
+     samtools view -h -F 4 -b ./Data/1-NOBLACKLIST_Bam/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST_SORT.bam > ./Data/3-IDR/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+     samtools index ./Data/3-IDR/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+     
+     nlines=\$(samtools idxstats ./Data/3-IDR/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST_ONLYMAPPED.bam | awk '{s+=\$3} END {print s}') ; nlines=\$(( (nlines + 1) / 2 )) ;
+     
+     samtools view ./Data/3-IDR/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST_ONLYMAPPED.bam > ./Data/3-IDR/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST_ONLYMAPPED.sam ;
+     ~/bin/Tools/sample/sample ./Data/3-IDR/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST_ONLYMAPPED.sam --shuffle | split -d -l \${nlines} - ./Data/3-IDR/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST_ONLYMAPPED ;" \
+     >> ./Scripts/IDR_STEP1.1_${day}${mark}_${rep}.txt
+     
+  done ;
+ done ;
+done
+ 
+
+# Run the analysis
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+  for rep in ${reps[@]} ; do
+    qsub \
+        -q ono \
+        -cwd \
+        -V \
+        -l mem_rsvd=32G \
+        -N IDR_Step_1.1 \
+        -e ./Std_Output/3-IDR/ \
+        -o ./Std_Output/3-IDR/ \
+        ./Scripts/IDR_STEP1.1_${day}${mark}_${rep}.txt
+  done ;
+ done ;
+done
+   
+##--> STEP 1.2 :  Sort and index the 2 PR .bam 
+
+# Creation of batch script
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+  for rep in ${reps[@]} ; do
+     
+     echo "\
+     samtools view -bT $genomeFile ./Data/3-IDR/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST_ONLYMAPPED00 > ./Data/3-IDR/"${day}${mark}_${rep}"_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+     samtools sort -@ 4 ./Data/3-IDR/"${day}${mark}_${rep}"_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ./Data/3-IDR/"${day}${mark}_${rep}"_tmp1 ;
+     mv ./Data/3-IDR/"${day}${mark}_${rep}"_tmp1.bam ./Data/3-IDR/"${day}${mark}_${rep}"_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+     samtools index ./Data/3-IDR/"${day}${mark}_${rep}"_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+     #rm ./Data/3-IDR/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST_ONLYMAPPED00
+     
+     samtools view -bT $genomeFile ./Data/3-IDR/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST_ONLYMAPPED01 > ./Data/3-IDR/"${day}${mark}_${rep}"_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+     samtools sort -@ 4 ./Data/3-IDR/"${day}${mark}_${rep}"_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ./Data/3-IDR/"${day}${mark}_${rep}"_tmp2 ;
+     mv ./Data/3-IDR/"${day}${mark}_${rep}"_tmp2.bam ./Data/3-IDR/"${day}${mark}_${rep}"_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+     samtools index ./Data/3-IDR/"${day}${mark}_${rep}"_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+     #rm ./Data/3-IDR/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST_ONLYMAPPED01" \
+     >> ./Scripts/IDR_STEP1.2_${day}${mark}_${rep}.txt
+     
+  done ;
+ done ;
+done  
+
+# Run the analysis
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+  for rep in ${reps[@]} ; do
+    qsub \
+        -pe thread 4 \
+        -q ono \
+        -cwd \
+        -V \
+        -N IDR_Step_1.2 \
+        -e ./Std_Output/3-IDR/ \
+        -o ./Std_Output/3-IDR/ \
+        ./Scripts/IDR_STEP1.2_${day}${mark}_${rep}.txt
+  done ;
+ done ;
+done
+
+##--> STEP 1.3 :  Peak calling on the two PR
+
+# Creation of batch script
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+  for rep in ${reps[@]} ; do
+    for pr in PR1 PR2 ; do
+        
+        qsub \
+            -l mem_rsvd=16G \
+            -q ono \
+            -cwd \
+            -V \
+            -N IDR_Step_1.3 \
+            -e ./Std_Output/3-IDR/ \
+            -o ./Std_Output/3-IDR/ \
+            -b y macs2 callpeak callpeak --format BAMPE --gsize hs -p $pvalPeaks --tempdir ./ -t ./Data/3-IDR/${day}${mark}_${rep}_${pr}_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -n ./Data/3-IDR/${day}${mark}_${rep}_${pr}_MACS2
+    
+    done ;
+  done ;
+ done ;
+done
+
+```
+
+### Peak calling on pooled pseudoreplicates of induvidual replicates
+
+```{bash, eval = FALSE}
+##--> STEP 2.1 : Pool the two replicates and create two pooled PS
+
+# Creation of batch script
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+   
+    echo "\
+   #3.1 pool bam files IPs
+   samtools view -H ./Data/3-IDR/"${day}${mark}"_Rep2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam > ./Data/3-IDR/"${day}${mark}"_Header.txt ;
+   samtools merge -h ./Data/3-IDR/"${day}${mark}"_Header.txt ./Data/3-IDR/"${day}${mark}"_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ./Data/3-IDR/"${day}${mark}"_Rep*_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+   samtools index ./Data/3-IDR/"${day}${mark}"_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+
+   #3.2 get pseudo-replicates
+   #Number of reads in the tagAlign file
+   nlines=\$(samtools idxstats ./Data/3-IDR/"${day}${mark}"_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.bam | awk '{s+=\$3} END {print s}') ; nlines=\$(( (nlines + 1) / 2 )) ;
+   
+    samtools view ./Data/3-IDR/"${day}${mark}"_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.bam > ./Data/3-IDR/"${day}${mark}"_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.sam
+   ~/bin/Tools/sample/sample ./Data/3-IDR/"${day}${mark}"_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.sam --shuffle | split -d -l \${nlines} -  ./Data/3-IDR/"${day}${mark}"_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED ;
+   
+   #pseudorep1
+   samtools view -bT $genomeFile ./Data/3-IDR/"${day}${mark}"_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED00 > ./Data/3-IDR/"${day}${mark}"_POOLED_REP1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+   samtools sort -@ 4 ./Data/3-IDR/"${day}${mark}"_POOLED_REP1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ./Data/1-NOBLACKLIST_Bam/"${day}${mark}"_tmp1 ;
+   mv ./Data/1-NOBLACKLIST_Bam/"${day}${mark}"_tmp1.bam ./Data/3-IDR/"${day}${mark}"_POOLED_REP1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+   samtools index ./Data/3-IDR/"${day}${mark}"_POOLED_REP1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+   
+   #pseudorep2
+   samtools view -bT $genomeFile ./Data/3-IDR/"${day}${mark}"_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED01 > ./Data/3-IDR/"${day}${mark}"_POOLED_REP2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+   samtools sort -@ 4 ./Data/3-IDR/"${day}${mark}"_POOLED_REP2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ./Data/1-NOBLACKLIST_Bam/"${day}${mark}"_tmp2 ;
+   mv ./Data/1-NOBLACKLIST_Bam/"${day}${mark}"_tmp2.bam ./Data/3-IDR/"${day}${mark}"_POOLED_REP2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+   samtools index ./Data/3-IDR/"${day}${mark}"_POOLED_REP2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam" \
+   >> ./Scripts/IDR_STEP2.1_${day}${mark}.txt
+
+ done ;
+done
+
+# Run the analysis
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+    qsub \
+        -pe thread 4 \
+        -l mem_rsvd=32G \
+        -q ono \
+        -cwd \
+        -V \
+        -N IDR_Step_2.1 \
+        -e ./Std_Output/3-IDR/ \
+        -o ./Std_Output/3-IDR/ \
+        ./Scripts/IDR_STEP2.1_${day}${mark}.txt
+  done ;
+done
+
+
+##--> STEP 2.2 : Peak calling on the two PR and the pooled replicates
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+  for pr in REP1 REP2 ; do
+        
+        qsub \
+            -l mem_rsvd=16G \
+            -q ono \
+            -cwd \
+            -V \
+            -N IDR_Step_2.2 \
+            -e ./Std_Output/3-IDR/ \
+            -o ./Std_Output/3-IDR/ \
+            -b y macs2 callpeak callpeak --format BAMPE --gsize hs --keep-dup all -p $pvalPeaks --tempdir ./ -t ./Data/3-IDR/${day}${mark}_POOLED_${pr}_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -n ./Data/3-IDR/${day}${mark}_POOLED_${pr}_MACS2
+    
+  done ;
+ done ;
+done
+
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+
+       qsub \
+            -l mem_rsvd=16G \
+            -q ono \
+            -cwd \
+            -V \
+            -N IDR_Step_2.2 \
+            -e ./Std_Output/3-IDR/ \
+            -o ./Std_Output/3-IDR/ \
+            -b y macs2 callpeak callpeak --format BAMPE --gsize hs --keep-dup all -p $pvalPeaks --tempdir ./ -t ./Data/3-IDR/${day}${mark}_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -n ./Data/3-IDR/${day}${mark}_POOLED_MACS2
+    
+ done ;
+done ;
+```
+
+### IDR 
+
+```{bash, eval = FALSE}
+
+##--> STEP 3.1 : Sort peaks by pval and select the first 100000
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+
+   sort -k 8nr,8nr ./Data/3-IDR/${day}${mark}_POOLED_REP1_MACS2_peaks.narrowPeak | head -n 100000 | gzip -c > ./Data/3-IDR/${day}${mark}_POOLED_REP1_MACS2_peaks.regionPeak.gz
+   sort -k 8nr,8nr ./Data/3-IDR/${day}${mark}_POOLED_REP2_MACS2_peaks.narrowPeak | head -n 100000 | gzip -c > ./Data/3-IDR/${day}${mark}_POOLED_REP2_MACS2_peaks.regionPeak.gz
+   sort -k 8nr,8nr ./Data/3-IDR/${day}${mark}_Rep2_PR1_MACS2_peaks.narrowPeak | head -n 100000 | gzip -c > ./Data/3-IDR/${day}${mark}_Rep2_PR1_MACS2_peaks.regionPeak.gz
+   sort -k 8nr,8nr ./Data/3-IDR/${day}${mark}_Rep2_PR2_MACS2_peaks.narrowPeak | head -n 100000 | gzip -c > ./Data/3-IDR/${day}${mark}_Rep2_PR2_MACS2_peaks.regionPeak.gz
+   sort -k 8nr,8nr ./Data/3-IDR/${day}${mark}_Rep3_PR1_MACS2_peaks.narrowPeak | head -n 100000 | gzip -c > ./Data/3-IDR/${day}${mark}_Rep3_PR1_MACS2_peaks.regionPeak.gz
+   sort -k 8nr,8nr ./Data/3-IDR/${day}${mark}_Rep3_PR2_MACS2_peaks.narrowPeak | head -n 100000 | gzip -c > ./Data/3-IDR/${day}${mark}_Rep3_PR2_MACS2_peaks.regionPeak.gz
+
+ done ;
+done;
+
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+   for rep in ${reps[@]} ; do
+    
+    sort -k 8nr,8nr ./Data/3-PEAK-CALLING/MACS/FRAG_ALL/SHARP/${day}${mark}_${rep}_MACS2_FRAG_ALL_SHARP_peaks.narrowPeak | head -n 100000 | gzip -c > ./Data/3-IDR/${day}${mark}_${rep}_MACS2_peaks.regionPeak.gz
+   
+  done ;
+ done ;
+done;
+
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+    
+    sort -k 8nr,8nr ./Data/3-IDR/${day}${mark}_POOLED_MACS2_peaks.narrowPeak | head -n 100000 | gzip -c > ./Data/3-IDR/${day}${mark}_POOLED_MACS2_peaks.regionPeak.gz
+
+ done ;
+done;
+
+
+##--> STEP 3.2 : Run the IDR
+
+# Creation of batch script
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+     
+    echo "\
+    #IDR ANALYSIS ON ORIGINAL REPLICATES 
+    Rscript ./Data/3-IDR/batch-consistency-analysis.r ./Data/3-IDR/"${day}${mark}"_Rep2_MACS2_peaks.regionPeak.gz ./Data/3-IDR/"${day}${mark}"_Rep3_MACS2_peaks.regionPeak.gz -1 ./Data/3-IDR/"${day}${mark}"_Rep2_vs_Rep3 0 F p.value ;
+    
+    #IDR ANALYSIS ON SELF-PSEUDOREPLICATES
+    Rscript ./Data/3-IDR/batch-consistency-analysis.r ./Data/3-IDR/"${day}${mark}"_Rep2_PR1_MACS2_peaks.regionPeak.gz ./Data/3-IDR/"${day}${mark}"_Rep2_PR2_MACS2_peaks.regionPeak.gz -1 ./Data/3-IDR/"${day}${mark}"_Rep2.1_vs_Rep2.2 0 F p.value ;
+    Rscript ./Data/3-IDR/batch-consistency-analysis.r ./Data/3-IDR/"${day}${mark}"_Rep3_PR1_MACS2_peaks.regionPeak.gz ./Data/3-IDR/"${day}${mark}"_Rep3_PR2_MACS2_peaks.regionPeak.gz -1 ./Data/3-IDR/"${day}${mark}"_Rep3.1_vs_Rep3.2 0 F p.value ;
+    
+    #IDR ANALYSIS ON POOLED-PSEUDOREPLICATES
+    Rscript ./Data/3-IDR/batch-consistency-analysis.r ./Data/3-IDR/"${day}${mark}"_POOLED_REP1_MACS2_peaks.regionPeak.gz ./Data/3-IDR/"${day}${mark}"_POOLED_REP2_MACS2_peaks.regionPeak.gz -1 ./Data/3-IDR/"${day}${mark}"_pooledPRep1_vs_pooledPRep2 0 F p.value" \
+  >> ./Scripts/IDR_STEP3.2_${day}${mark}.txt
+  
+  done;
+done;
+
+
+# Run the analysis
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+    qarray \
+        -l mem_rsvd=8G \
+        -q ono \
+        -cwd \
+        -V \
+        -N IDR_Step_3.2 \
+        -e ./Std_Output/3-IDR/ \
+        -o ./Std_Output/3-IDR/ \
+        ./Scripts/IDR_STEP3.2_${day}${mark}.txt
+  done ;
+done
+
+##--> STEP 3.3 : Summarize the results
+
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+     
+  sigRep=.02 ; sigPRep=.02 ; sigPooledPrep=.005
+  numPeaks_Rep1Rep2=$(awk -v s=$sigRep '$11 <= s {print $0}' ./Data/3-IDR/${day}${mark}_Rep2_vs_Rep3-overlapped-peaks.txt | wc -l)
+  numPeaks_PRep11PRep12=$(awk -v s=$sigPRep '$11 <= s {print $0}' ./Data/3-IDR/${day}${mark}_Rep2.1_vs_Rep2.2-overlapped-peaks.txt | wc -l)
+  numPeaks_PRep21PRep22=$(awk -v s=$sigPRep '$11 <= s {print $0}' ./Data/3-IDR/${day}${mark}_Rep3.1_vs_Rep3.2-overlapped-peaks.txt | wc -l)
+  numPeaks_pooledPRep1PRep2=$(awk -v s=$sigPooledPrep '$11 <= s {print $0}' ./Data/3-IDR/${day}${mark}_pooledPRep1_vs_pooledPRep2-overlapped-peaks.txt | wc -l)
+    
+  echo $mark $day  
+  echo $numPeaks_Rep1Rep2 $numPeaks_pooledPRep1PRep2 : reps vs pooled
+  echo $numPeaks_PRep11PRep12 $numPeaks_PRep21PRep22 : preps
+
+  if [ $numPeaks_Rep1Rep2 -gt $numPeaks_pooledPRep1PRep2 ] ; then opTh=$numPeaks_Rep1Rep2 ; else opTh=$numPeaks_pooledPRep1PRep2 ; fi
+
+  echo choosen opTh $opTh 
+
+  zcat ./Data/3-IDR/${day}${mark}_POOLED_MACS2_peaks.regionPeak.gz  | sort -k8nr,8nr | head -n $opTh > ./Data/3-IDR/${day}${mark}_MACS2_OPTIMAL_IDR.bed
+  
+ done;
+done;
+
+##--> Create a global .bed file with regions opened in a least one time point
+for i in $(ls ./Data/3-IDR/ | grep _OPTIMAL_IDR.bed | grep -v MERGE | sed 's/_MACS2_OPTIMAL_IDR.bed//g')
+do
+    bedtools sort -i ./Data/3-IDR/"$i"_MACS2_OPTIMAL_IDR.bed > ./Data/3-IDR/"$i"_MACS2_OPTIMAL_IDR.bed.tmp
+    mv ./Data/3-IDR/"$i"_MACS2_OPTIMAL_IDR.bed.tmp ./Data/3-IDR/"$i"_MACS2_OPTIMAL_IDR.bed
+done
+
+cat ./Data/3-IDR/D*ATAC_MACS2_OPTIMAL_IDR.bed | bedtools sort -i - | bedtools merge  -i - > ./Data/3-IDR/ATAC_IDR_COMBINE_SORT.bed
+
+```
+
+# Annotation
+
+```{r}
+##--> Load the GenomicRanges and rtracklayer package
+library(GenomicRanges)
+library(rtracklayer)
+
+##--> Import annotation
+annot_atac <- read.table("./results/MICROARRAY_ANNOTATION_BIOCONDUCTOR.txt", sep = "\t",
+                         header = TRUE, stringsAsFactors = FALSE)
+
+##--> Format
+annot_atac <- annot_atac[-which(is.na(annot_atac$Chromosome) |
+                                is.na(annot_atac$Start) |
+                                is.na(annot_atac$Stop)),]
+
+annot_atac <- GRanges(seqnames = paste("chr", annot_atac$Chromosome, sep = ""),
+                      IRanges(start = annot_atac$Start, end = annot_atac$Stop),
+                      mcols = data.frame(probes = as.character(annot_atac$Probe_ID),
+                                         gene = as.character(annot_atac$HGNC_Symbol)))
+
+##--> Liftover from hg38 to hg19
+chain <- import.chain("./tools/hg38ToHg19.over.chain")
+annot_chip <- unlist(liftOver(annot_atac, chain))
+```
+
+# Quality check
+
+## Genome-wide correlation heatmap
+
+### Preparing data
+
+```{r}
+##--> Load the GenomicRanges package
+library(GenomicRanges)
+library(GenomicAlignments)
+library(BiocParallel)
+library(rtracklayer)
+
+##--> List alignment files
+bam_atac <- list.files(path = "./data/ATAC-seq/",
+                       pattern = ".bam$",
+                       full = TRUE)
+
+##---> Import the merge sets of reproducible ATAC peaks
+peaks <- import("./data/ATAC-seq/GOLDSTANDARD_ATACSEQ_ALL_DAY_IDR.bed")
+```
+
+### Counting reads inside each peaks
+
+```{r}
+##--> Compute genome-wide coverage 
+# Create a function to compute the coverage
+summarizeOverlaps_batch <- function(bam) {
+    count <- summarizeOverlaps(peaks, bam,ignore.strand = TRUE, inter.feature = FALSE)
+    return(count)
+}
+
+# Run the counting in multi-thread
+count_all <- bplapply(bam_atac,
+                      summarizeOverlaps_batch, BPPARAM = MulticoreParam(bpprogressbar=TRUE))
+
+# Transform the SummarizedExperiment object in numeric matrix
+count_all_matrix <- do.call(cbind, lapply(count_all, assay))
+
+# Change names of columns
+colnames(count_all_matrix) <- gsub("RASOIS_ATACSEQ_|\\.bam", "", colnames(count_all_matrix)) 
+```
+
+### Normalization and debatching
+
+```{r}
+#--> Load libraries
+library(RUVSeq)
+
+#--> Quantile normalization
+qn_counts <- betweenLaneNormalization(count_all_matrix, which = "full")
+
+#--> Debatching
+set <- newSeqExpressionSet(round(qn_counts))
+differences <- matrix(data = c(1:18), ncol = 3, byrow = TRUE)
+set_RUVs <- RUVs(x = set, cIdx = row.names(set), k = 3, scIdx = differences)
+qn_and_ruv_count <- normCounts(set_RUVs)
+```
+
+### Creating the pairwise correlation matrix
+
+```{r}
+##--> Calculate pariwise Pearson's correlation before / after debatching
+cor_count_all_matrix_qn  <- cor(qn_counts, method = "pearson")
+cor_count_all_matrix_ruv <- cor(qn_and_ruv_count, method = "pearson")
+```
+
+### Drawing the correlation heatmap
+
+```{r, fig.cap= "Pair-wise Pearson's correlation heatmap for genome-wide histone modification ATAC-seq", fig.height=15}
+##--> Load the packages
+library(pheatmap)
+library(colorRamps)
+library(gridExtra)
+
+##--> Draw heatmap
+P1 <- pheatmap(cor_count_all_matrix_qn,
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation",
+         clustering_method = "ward.D2", silent = TRUE,
+         main = "Pair-wise Pearson's correlation heatmap - Quantile normalization",
+         color = matlab.like(c(1000)))
+
+P2 <- pheatmap(cor_count_all_matrix_ruv,
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation",
+         clustering_method = "ward.D2", silent = TRUE,
+         main = "Pair-wise Pearson's correlation heatmap - Quantile normalization + Debatching",
+         color = matlab.like(c(1000)))
+
+do.call(grid.arrange,list(P1[[4]],P2[[4]]))
+```
+
+## Saturation analysis
+
+As a prerequisite for saturation analysis, we do the following:
+
+ * cut the genome in bins of fixed size (i.e. 1kb),
+ * count the number of reads aligned on each of these bins for each alignment files,
+ * remove bins on which no alignment is reported in all of the alignment files (otherwise, it will artificially increase the correlation),
+
+We will then use the raw count matrix `count_all_matrix` that includes bins of the genome where no read aligns. Based on these counts, for each library independently, we then interpolate a species accumulation curve using the package `r CRANpkg("preseqR")`.This allows to predict the molecular complexity of sequencing libraries. The idea is to use the information gained from the number of times each 1kb is observed to predict the number of new, currently unobserved, bins that will be gained from additional sequencing.
+
+### Preparing data
+
+```{r}
+##--> Load the GenomicRanges package
+library(preseqR)
+
+##--> List alignment files
+bam_atac <- list.files(path = "./data/ATAC-seq/",
+                       pattern = ".bam$",
+                       full = TRUE)
+
+library(BSgenome.Hsapiens.UCSC.hg19)
+genome <- BSgenome.Hsapiens.UCSC.hg19
+
+##--> Use the tileGenome function to tile the genome
+tile <- tileGenome(seqlengths(genome), tilewidth = 1000)
+```
+
+### Counting reads inside each bin
+
+```{r}
+##--> Compute genome-wide coverage 
+# Create a function to compute the coverage
+summarizeOverlaps_batch <- function(bam) {
+    count <- summarizeOverlaps(tile, bam, ignore.strand = TRUE, inter.feature = FALSE)
+    return(count)
+}
+
+# Run the counting in multi-thread
+count_all <- bplapply(bam_atac, summarizeOverlaps_batch, BPPARAM = MulticoreParam())
+
+# Transform the SummarizedExperiment object in numeric matrix
+count_all_matrix <- do.call(cbind, lapply(count_all, assay))
+
+# Change names of columns
+colnames(count_all_matrix) <- gsub("RASOIS_ATACSEQ_|\\.bam", "", colnames(count_all_matrix)) 
+
+##--> Indentifying and removing bins with no read
+# Sum across lines of the count matrix
+zero <- apply(count_all_matrix, 1, sum)
+
+# Remove lines for which the sum == 0
+count_all_matrix_clean <- count_all_matrix[-which(zero==0),]
+```
+
+```{r, fig.cap= "Species accumulation curves for genome-wide histone modification ATAC-seq", fig.height=10}
+##--> Load the preseqR package
+library(preseqR)
+
+##--> Select data for the saturation analysis
+saturation <- count_all_matrix_clean
+
+##--> Create the object used to output the results for each saturation analysis
+saturation_res <- data.frame()
+
+##--> Runing saturation analysis for each library
+for (i in 1:ncol(saturation)) {
+  table <- table(saturation[,i])
+  test <- preseqR.interpolate.distinct(1000000, as.matrix(data.frame(cbind(as.double(names(table)),table)))[-1,])
+  test <- data.frame(test)
+  test$Name <- rep(colnames(saturation)[i],nrow(test))
+  saturation_res <- rbind(saturation_res, test)
+}
+
+##--> Reordering the output for clarity
+saturation_res$Day <- factor(gsub(".*_ATACSEQ_|_REP[123]", "", saturation_res$Name),  levels = c("T0", "24H", "48H",
+                                                                                                 "72H",  "96H", "144H"))
+saturation_res$Rep <- as.factor(gsub(".*_", "", saturation_res$Name))
+
+##--> Ploting results
+library(ggplot2)
+saturation_plot <- ggplot(saturation_res, aes(x = sample.size, y = interpolation)) +
+  geom_point(aes(fill = Rep), alpha = 0.7, colour="black",pch=21, size=1) +
+  facet_wrap(~ Day) +
+  scale_x_continuous(name = "Number of mapped reads") +
+  scale_y_continuous(name = "Number of peaks covered") +
+  ggtitle("Mapped-bins accumulation curves for mapped reads in each libraries") +
+  theme_bw()
+saturation_plot
+```
+
+## Genome-wide profiles around TSS
+
+Before starting this analysis, we need to retrieve the coordinates of TSS on a data-base such as UCSC or Biomart.
+
+### Preparing the data 
+
+```{r}
+##--> Load the biomeRt and the biovizBase packages
+library(biomaRt)
+library(biovizBase)
+
+##--> Connexion to BioMart hg19 (aka GRCh37)
+ensembl <- useMart(biomart="ENSEMBL_MART_ENSEMBL",
+                   host="grch37.ensembl.org",
+                   path="/biomart/martservice",
+                   dataset="hsapiens_gene_ensembl")
+
+##--> Retrive the coordinates of TSSs
+tss <- getBM(mart = ensembl,
+             attributes = c("chromosome_name",
+                            "transcription_start_site",
+                            "hgnc_symbol",
+                            "strand"))
+
+##--> Format the chromosome name column (to match the chromosome names in alignement files)
+set.seed(1234)
+tss <- tss[grep("^[1-9]{1,2}$", tss$chromosome_name),]
+tss <- tss[sample(1:nrow(tss), 10000),]
+tss$chromosome_name <- paste("chr", tss$chromosome_name, sep = "")
+
+##--> Creating a GRange containing the information related to TSSs
+# And add a +/- 1kb window
+tss_gr <- GRanges(seqnames = tss$chromosome_name,
+                  ranges = IRanges(start = tss$transcription_start_site - 500,
+                                   end = tss$transcription_start_site + 500,
+                                   names = tss$hgnc_symbol),
+                  strand = tss$strand)
+
+##--> For each TSS +/- 500bp, tile the window in 100 bins
+tss_split <- tile(tss_gr, n = 100)
+tss_split <- flatGrl(tss_split) 
+```
+
+Now that the object containing information related to TSSs is formated, we will first list the alignement files we are interested in, and count the reads overlapping each tiles consituting each TSS window.
+
+### Counting reads inside each bin
+
+```{r}
+##--> Create a function to compute the coverage
+summarizeOverlaps_tss_batch <- function(bam) {
+    count <- summarizeOverlaps(tss_split,
+                               bam,
+                               inter.feature = FALSE,
+                               fragments = FALSE,
+                               singleEnd = FALSE,
+                               param = ScanBamParam(which = tss_gr))
+    return(count)
+}
+
+##--> Count reads in bins
+count_tss <- bplapply(bam_atac, summarizeOverlaps_tss_batch, BPPARAM = MulticoreParam())
+
+##--> Transform the SummarizedExperiment object in numeric matrix
+count_tss_matrix <- do.call(cbind, lapply(count_tss, assay))
+
+##--> Change names of columns
+colnames(count_tss_matrix) <- gsub("RAS_OIS_ATACSEQ_|\\.bam", "", colnames(count_tss_matrix)) 
+```
+
+### Formating output and plot
+
+```{r, fig.cap= "TSS metaprofiles for histone modification ChIP-seq", fig.height=7}
+day  <- factor(gsub(".*_ATACSEQ_|_REP[123]", "", colnames(count_tss_matrix)), 
+               levels = c("T0", "24H", "48H","72H",  "96H", "144H"))
+
+##--> Create a list of count tables (one per sample)
+count_tss_list <- lapply(split(count_tss_matrix,
+                               rep(1:ncol(count_tss_matrix),
+                                   each = nrow(count_tss_matrix))),
+                         function(x) {matrix(x, ncol=100, byrow = TRUE)})
+names(count_tss_list) <- colnames(count_tss_matrix)
+
+##--> Take the gene strand into account
+count_tss_list <- lapply(count_tss_list, function(x) {
+  x[which(strand(tss_gr) == "+"),c(1:100)] <- x[which(strand(tss_gr) == "+"), c(1:100)]
+  x[which(strand(tss_gr) == "-"),c(1:100)] <- x[which(strand(tss_gr) == "-"), c(100:1)]
+})
+
+##--> Compute a CPM-normalized average signal
+count_tss_list <- lapply(count_tss_list, function(x) {
+  #x <- x / sum(x) * 1000000
+  x <- colMeans(x)
+})
+
+
+##--> Format
+count_tss_plot <- reshape2::melt(count_tss_list)
+count_tss_plot$Dist_to_TSS <- seq(from = -500, to = 500, length.out = 101)[-1]
+count_tss_plot$Time  <- factor(gsub(".*_ATACSEQ_|_REP[123]", "", count_tss_plot$L1), 
+                                levels = c("T0", "24H", "48H","72H",  "96H", "144H"))
+count_tss_plot$Replicate <- factor(gsub("RASOIS_.*_", "", count_tss_plot$L1), 
+                                levels = c("REP1", "REP2", "REP3"))
+colnames(count_tss_plot) <- c("RPM", "Bam", "Dist_to_TSS", "Time", "Replicate")
+
+##--> Create Plots
+ggplot(count_tss_plot, aes(x = Dist_to_TSS, y = RPM, group = Replicate)) +
+  geom_line(aes(color = Replicate)) +
+  facet_wrap(~Time) +
+  scale_x_continuous(name = "Distance to TSS (bp)") +
+  scale_y_continuous(name = "Average read per million mapped reads (N)") +
+  ggtitle("TSS metaprofiles for histone modification ChIP-seq") +
+  theme_bw()
+
+```
+
+## Fragment length distribution
+
+```{r, fig.cap= "Fragment length distribution profiles"}
+##--> Load libraries
+library(BiocParallel)
+library(Rsamtools)
+library(ggplot2)
+
+##--> Create a function to get fragment length from .bam files
+get_fl <- function(bam) {
+        fl <- scanBam(file = bam, 
+                     index = bam,
+                     use.names = TRUE,
+                     param = ScanBamParam(what = c("isize")), which = peaks)
+    return(fl)
+}
+
+##--> Count reads in bins
+fl <- bplapply(bam_atac, get_fl, BPPARAM = MulticoreParam())
+
+##--> Generate counting tables
+fl_table <- lapply(fl, function(x) {table(abs(unlist(x)))})
+
+##--> Reshape and scale
+names(fl_table) <- gsub("RAS_OIS_ATACSEQ_|\\.bam", "", colnames(count_tss_matrix)) 
+fl_table_2 <- lapply(fl_table, function(x) {(x / sum(x)) * 10^6})
+fl_table_2 <- reshape2::melt(fl_table_2)
+
+##--> Format
+fl_table_2$Time  <- factor(gsub(".*_ATACSEQ_|_REP[123]", "", fl_table_2$L1), 
+                                levels = c("T0", "24H", "48H","72H",  "96H", "144H"))
+fl_table_2$Replicate <- factor(gsub("RASOIS_.*_", "", fl_table_2$L1), 
+                                levels = c("REP1", "REP2", "REP3"))
+colnames(fl_table_2) <- c("FL", "Frequence", "Bam", "Time", "Replicate")
+
+##--> Create Plots
+ggplot(fl_table_2, aes(x= FL, y = (Frequence), group = Time)) +
+  geom_line(aes(color = Time)) +
+  scale_color_manual(values = rainbow(n=12)[c(1,7:12)]) +
+  scale_x_continuous(limits = c(1,500)) + 
+  xlab("Fragment length") +
+  ylab("Counts") +
+  facet_wrap(~Replicate)
+
+```
+
+# Nucleosome positioning 
+
+Preprocessed ATAC-seq data were first down-sampled to reach for each library the minimal number of reads obtained in each batch across time-points and replicates. Down-sampled replicates corresponding to a given time-point were then merged. These down-sampled and merged data were then used in combination with chromatin accessible regions defined before as the input to [NucleoATAC v0.3.1](https://github.com/GreenleafLab/NucleoATAC/releases) to define nucleosome density inside accessible regions.
+
+## Merging replicates and downsampling
+
+```{bash, eval = FALSE}
+
+##--> Merge bam files from replicates
+
+days=(D0 D1 D2 D3 D4 D6)
+for day in ${days[@]}
+do
+    qsub \
+     -q ono \
+     -cwd \
+     -V \
+     -pe thread 8 \
+     -b y samtools merge -@ 8 -h ./Data/1-NOBLACKLIST_Bam/Header.txt \
+            ./Data/1-NOBLACKLIST_Bam/${day}ATAC_MERGE_123_DEDUP_NOBLACKLIST.bam \
+            ./Data/1-NOBLACKLIST_Bam/${day}ATAC_Rep1_DEDUP_NOBLACKLIST_SORT.bam \
+            ./Data/1-NOBLACKLIST_Bam/${day}ATAC_Rep2_DEDUP_NOBLACKLIST_SORT.bam \
+            ./Data/1-NOBLACKLIST_Bam/${day}ATAC_Rep3_DEDUP_NOBLACKLIST_SORT.bam
+done
+
+##--> Subsample merged files
+
+nlinesD0=$(samtools idxstats ./Data/1-NOBLACKLIST_Bam/D0ATAC_MERGE_123_DEDUP_NOBLACKLIST.bam | awk '{s+=$3} END {print s}');
+nlinesD1=$(samtools idxstats ./Data/1-NOBLACKLIST_Bam/D1ATAC_MERGE_123_DEDUP_NOBLACKLIST.bam | awk '{s+=$3} END {print s}');
+nlinesD2=$(samtools idxstats ./Data/1-NOBLACKLIST_Bam/D2ATAC_MERGE_123_DEDUP_NOBLACKLIST.bam | awk '{s+=$3} END {print s}');
+nlinesD3=$(samtools idxstats ./Data/1-NOBLACKLIST_Bam/D3ATAC_MERGE_123_DEDUP_NOBLACKLIST.bam | awk '{s+=$3} END {print s}');
+nlinesD4=$(samtools idxstats ./Data/1-NOBLACKLIST_Bam/D4ATAC_MERGE_123_DEDUP_NOBLACKLIST.bam | awk '{s+=$3} END {print s}');
+nlinesD6=$(samtools idxstats ./Data/1-NOBLACKLIST_Bam/D6ATAC_MERGE_123_DEDUP_NOBLACKLIST.bam | awk '{s+=$3} END {print s}');
+nlinesMin=$(echo "$nlinesD0"; echo "$nlinesD1"; echo "$nlinesD2"; echo "$nlinesD3"; echo  "$nlinesD4"; echo  "$nlinesD6");
+nlinesMin=$(echo $nlinesMin |sed 's/\s/\n/g' | sort -n| head -n1)
+
+probD0=$(echo $nlinesMin $nlinesD0 | awk '{print $1/$2}')
+probD1=$(echo $nlinesMin $nlinesD1 | awk '{print $1/$2}')
+probD2=$(echo $nlinesMin $nlinesD2 | awk '{print $1/$2}')
+probD3=$(echo $nlinesMin $nlinesD3 | awk '{print $1/$2}')
+probD4=$(echo $nlinesMin $nlinesD4 | awk '{print $1/$2}')
+probD6=$(echo $nlinesMin $nlinesD6 | awk '{print $1/$2}')
+prob=($probD0 $probD1 $probD2 $probD3 $probD4 $probD6)
+
+
+# Create a batch script
+days=(D0 D1 D2 D3 D4 D6)
+i=0
+for day in ${days[@]}
+do
+    echo "java -jar -Xmx16g ~/bin/Tools/PicardTools_v1.130/picard.jar \
+              DownsampleSam \
+              PROBABILITY=${prob[i]} \
+              I=./Data/1-NOBLACKLIST_Bam/"$day"ATAC_MERGE_123_DEDUP_NOBLACKLIST.bam \
+              O=./Data/1-NOBLACKLIST_Bam/"$day"ATAC_MERGE_123_DEDUP_NOBLACKLIST_DOWNSAMPLED.bam" \
+        >> ./Scripts/DOWNSAMPLING.txt
+    i=$i+1
+done
+
+
+# Run the analysis        
+qarray \
+    -q ono \
+    -cwd \
+    -V \
+    -N Downsampling \
+    -e ./Std_Output/1-Downsampling/ \
+    -o ./Std_Output/1-Downsampling/ \
+    ./Scripts/DOWNSAMPLING.txt   
+```
+
+
+## Nucleosome calling
+
+```{bash, eval = FALSE}
+##--> Combine and / or Extend intervals in MAC2 IDR peaks
+
+bedtools slop -b 200 -i ./Data/3-IDR/ATAC_IDR_COMBINE_SORT.bed -g ~/save/Outils/hg19_chrom.sizes | \
+awk -f ~/bin/Scripts/combine_extended_bed.awk \
+> ./Data/3-PEAK-CALLING/NucleoATAC/ATAC_IDR_COMBINE_SORT_EXTENDED_200BP.bed
+
+cat ./Data/3-IDR/ATAC_IDR_COMBINE_SORT.bed | \
+awk -f ~/bin/Scripts/combine_extended_bed.awk \
+> ./Data/3-PEAK-CALLING/NucleoATAC/ATAC_IDR_COMBINE_SORT.bed
+
+##--> NucleoATAC workflow
+
+# Creation of batch script
+for i in $(ls ./Data/1-NOBLACKLIST_Bam/ |grep _DOWNSAMPLED.bam$ | grep -v FRAG | grep -v Rep1 | sed 's/_MERGE_123_DEDUP_NOBLACKLIST_DOWNSAMPLED.bam//g')
+do
+    echo "\
+    nucleoatac occ \
+      --cores 8 \
+      --bed ./Data/3-PEAK-CALLING/NucleoATAC/ATAC_IDR_COMBINE_SORT_EXTENDED_200BP.bed \
+      --bam ./Data/1-NOBLACKLIST_Bam/"$i"_MERGE_123_DEDUP_NOBLACKLIST_DOWNSAMPLED.bam \
+      --fasta /local/databases/index/samtools/hg19/0.1.19/hg19.fa \
+      --out ./Data/3-PEAK-CALLING/NucleoATAC/"$i"_MERGE_123;
+    
+    nucleoatac vprocess \
+      --size ./Data/3-PEAK-CALLING/NucleoATAC/"$i"_MERGE_123.nuc_dist.txt \
+      --out ./Data/3-PEAK-CALLING/NucleoATAC/"$i"_MERGE_123;
+    
+    nucleoatac nuc \
+      --cores 8 \
+      --sizes ./Data/3-PEAK-CALLING/NucleoATAC/"$i"_MERGE_123.nuc_dist.txt \
+      --occ_track ./Data/3-PEAK-CALLING/NucleoATAC/"$i"_MERGE_123.occ.bedgraph.gz \
+      --vmat ./Data/3-PEAK-CALLING/NucleoATAC/"$i"_MERGE_123.VMat \
+      --bed ./Data/3-PEAK-CALLING/NucleoATAC/ATAC_IDR_COMBINE_SORT_EXTENDED_200BP.bed \
+      --bam ./Data/1-NOBLACKLIST_Bam/"$i"_MERGE_123_DEDUP_NOBLACKLIST_DOWNSAMPLED.bam \
+      --fasta /local/databases/index/samtools/hg19/0.1.19/hg19.fa \
+      --out ./Data/3-PEAK-CALLING/NucleoATAC/"$i"_MERGE_123;
+      
+    nucleoatac merge \
+      --occpeaks ./Data/3-PEAK-CALLING/NucleoATAC/"$i"_MERGE_123.occpeaks.bed.gz \
+      --nucpos ./Data/3-PEAK-CALLING/NucleoATAC/"$i"_MERGE_123.nucpos.bed.gz;
+      
+    nucleoatac nfr \
+      --cores 8 \
+      --bed ./Data/3-PEAK-CALLING/NucleoATAC/ATAC_IDR_COMBINE_SORT_EXTENDED_200BP.bed \
+      --occ_track ./Data/3-PEAK-CALLING/NucleoATAC/"$i"_MERGE_123.occ.bedgraph.gz \
+      --calls ./Data/3-PEAK-CALLING/NucleoATAC/"$i"_MERGE_123.occpeaks.bed.gz \
+      --bam ./Data/1-NOBLACKLIST_Bam/"$i"_MERGE_123_DEDUP_NOBLACKLIST_DOWNSAMPLED.bam \
+      --fasta /local/databases/index/samtools/hg19/0.1.19/hg19.fa --out ./Data/3-PEAK-CALLING/NucleoATAC/"$i"_MERGE_123"\
+    >> ./Scripts/NucleoATAC_$i.txt
+done
+
+for i in $(ls ./Data/1-NOBLACKLIST_Bam/ |grep _DOWNSAMPLED.bam$ | grep -v FRAG | grep -v Rep1 | sed 's/_MERGE_123_DEDUP_NOBLACKLIST_DOWNSAMPLED.bam//g')
+do
+    qsub \
+        -q ono \
+        -cwd \
+        -V \
+        -N Nucleo_"$i" \
+        -pe thread 8 \
+        -e ./Std_Output/3-NucleoATAC/ \
+        -o ./Std_Output/3-NucleoATAC/ \
+        ./Scripts/NucleoATAC_"$i".txt
+done
+
+```
+
+# Transcription factor footprinting
+
+[PIQ](https://bitbucket.org/thashim/piq-single/src) was used to predict transcription factor binding sites from the genome sequence on down-sampled ATAC-seq alignments. For each motif, we retained only binding sites that were within the reproducible ATAC-seq peaks and passed the default purity cut-off (70%).
+
+## Footprinting wit PIQ
+
+```{bash, eval = FALSE}
+
+days=(D0 D1 D2 D3 D4 D6)
+
+##--> STEP 1 : Convert BAM to internal binary format (does not depend on choice of motif).
+# [arg1]: file with basic parameters,
+# [arg2]: name of the output, 
+# [arg3]: name of the input
+
+# For each time points
+for day in ${days[@]}
+do
+    qsub -q ono -cwd -l mem_rsvd=128G -V -b y Rscript ~/bin/Tools/PIQ/pairedbam2rdata.r \
+                                         ~/bin/Tools/PIQ/common.r \
+                                         ./Data/5-FOOTPRINTING/PIQ/"$day"ATAC_MERGE_123_DOWNSAMPLED_PIQ.RData \
+                                         ./Data/1-NOBLACKLIST_Bam/"$day"ATAC_MERGE_123_DEDUP_NOBLACKLIST_DOWNSAMPLED.bam
+done
+
+
+##--> STEP 2 : Generate the PWM hits across genome (does not depend on choice of BAM).
+# [arg1]: file with basic parameters,
+# [arg2]: file containing the pwms, 
+# [arg3]: indice of the motif of interest on the file containing pwms
+
+# Create a batch file
+for i in $(seq 519)
+do
+    echo "Rscript ~/bin/Tools/PIQ/pwmmatch.exact.r \
+          ~/bin/Tools/PIQ/common.r \
+          ~/bin/Tools/PIQ/pwms/jaspar_eukaryotes_519_TF.txt "$i" \
+          ./Data/5-FOOTPRINTING/PIQ/Motif_Matches/" \
+    >> ./Scripts/PIQ_PWM_MATCH.txt
+done
+
+# Run the analysis
+qarray \
+        -q ono \
+        -cwd \
+        -V \
+        -N PIQ_PWM \
+        -e ./Std_Output/5-PIQ/ \
+        -o ./Std_Output/5-PIQ/ \
+        ./Scripts/PIQ_PWM_MATCH.txt
+
+
+##--> STEP 3 : Combine BAM + PWM  (depends on choice of BAM and PWM).
+# [arg1]: file with basic parameters,
+# [arg2]: repository containing the motif matches of the motif of interest,
+# [arg3]: temporty repository, 
+# [arg4]: output repository, 
+# [arg5]: converted bam file
+
+for day in ${days[@]}
+do
+    mkdir -p ./Data/5-FOOTPRINTING/PIQ/Tmp/"${day}"
+    mkdir -p ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/"${day}"
+done
+ 
+# Create a batch file
+for i in $(seq 519); do
+    echo "Rscript ~/bin/Tools/PIQ/permark.r \
+        ~/bin/Tools/PIQ/common.r \
+        ./Data/5-FOOTPRINTING/PIQ/Motif_Matches/ \
+        ./Data/5-FOOTPRINTING/PIQ/Tmp/ALL_ATAC/ \
+        ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/ALL_ATAC/ \
+        ./Data/5-FOOTPRINTING/PIQ/ALL_ATAC_PIQ_FIFTY_PERCENT.RData "$i"" \
+        >> ./Scripts/PIQ_TRAIN.txt
+done
+
+# Run the analysis
+qarray \
+        -q ono \
+        -cwd \
+        -V \
+        -N PIQ_TRAIN \
+        -e ./Std_Output/5-PIQ/ \
+        -o ./Std_Output/5-PIQ/ \
+        ./Scripts/PIQ_TRAIN.txt
+
+##--> STEP 4 : Combine BAM + PWM to TRAIN (depends on choice of BAM and PWM).
+# [arg1]: file with basic parameters, 
+# [arg2]: repository containing the motif matches of the motif of interest,
+# [arg3]: temporty repository, 
+# [arg4]: output repository, 
+# [arg5]: converted bam file use for training
+# [arg5]: converted bam file use for testing
+
+# Create a batch file
+
+for day in ${days[@]}; do
+    for i in $(seq 519); do
+        echo "Rscript ~/bin/Tools/PIQ/permark.r \
+            ~/bin/Tools/PIQ/common.r \
+            ./Data/5-FOOTPRINTING/PIQ/Motif_Matches/ \
+            ./Data/5-FOOTPRINTING/PIQ/Tmp/${day}/ \
+            ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/${day}/ \
+            ./Data/5-FOOTPRINTING/PIQ/"$day"ATAC_MERGE_123_DOWNSAMPLED_PIQ.RData "$i"" \
+        >> ./Scripts/PIQ_TEST.txt
+    done
+done
+
+# Run the analysis
+qarray \
+        -q ono \
+        -cwd \
+        -V \
+        -N PIQ_TEST \
+        -e ./Std_Output/5-PIQ/ \
+        -o ./Std_Output/5-PIQ/ \
+        ./Scripts/PIQ_TEST.txt
+
+##--> Rename output to remove space in the name
+for day in ${days[@]}; do
+    echo $day
+    find ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/"$day"/ -type f -name "* *" -exec bash -c 'mv "$0" "${0// /_}"' {} \;
+done
+
+##--> Convert .csv file with true calls in .bed
+for day in ${days[@]}; do
+    echo $day
+    for i in $(ls --color=never ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/"$day"/ | grep "chropen.txt"); do
+            
+        mark1=$(echo $i | sed 's/-chropen.txt//g')
+        cat ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/"$day"/"$mark1"-calls.csv | sed 's/"//g'  | sed 's/,/\t/g' |\
+        grep -vP '^\t' | awk '{OFS = "\t"};{print $2, $3, $3, $4, $5, $6, $7}' \
+        > ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/Bilan_Call/PIQ_CALL_"$day"_"$mark1".bed
+        
+    done
+done
+
+##--> Intersect with the global IDR peak sets
+for day in ${days[@]}; do
+
+    echo $day
+    
+    for i in $(ls --color=never ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/"$day"/ | grep "chropen.txt"); do
+    
+        i=$(echo $i | sed 's/\s/_/g')
+        mark1=$(echo $i | sed 's/-chropen.txt//g')
+        intersectBed \
+            -a ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/Bilan_Call/PIQ_CALL_"$day"_"$mark1".bed \
+            -b ./Data/3-PEAK-CALLING/NucleoATAC/ATAC_IDR_COMBINE_SORT.bed \
+            -wa -u \
+            > ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/Bilan_Call/PIQ_CALL_IDR_"$day"_"$mark1".bed
+            
+    done
+done
+
+##--> Summarize the results in a global matrix
+
+for i in $(ls ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/D0/ | grep "chropen.txt"); do
+
+    mark1=$(echo $i | sed 's/-chropen.txt//g')
+    mark2=$(echo $mark1 | sed 's/.*-//g')
+    
+    open_D0=$(cat ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/D0/"$i" |sed 's/,/\t/g' |cut -f 2)
+    nsig_D0=$(cat ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/Bilan_Call/PIQ_CALL_IDR_D0_"$mark1".bed |wc -l)
+    
+    open_D1=$(cat ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/D1/"$i" |sed 's/,/\t/g' |cut -f 2)
+    nsig_D1=$(cat ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/Bilan_Call/PIQ_CALL_IDR_D1_"$mark1".bed |wc -l)
+    
+    open_D2=$(cat ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/D2/"$i" |sed 's/,/\t/g' |cut -f 2)
+    nsig_D2=$(cat ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/Bilan_Call/PIQ_CALL_IDR_D2_"$mark1".bed |wc -l)
+    
+    open_D3=$(cat ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/D3/"$i" |sed 's/,/\t/g' |cut -f 2)
+    nsig_D3=$(cat ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/Bilan_Call/PIQ_CALL_IDR_D3_"$mark1".bed |wc -l)
+    
+    open_D4=$(cat ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/D4/"$i" |sed 's/,/\t/g' |cut -f 2)
+    nsig_D4=$(cat ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/Bilan_Call/PIQ_CALL_IDR_D4_"$mark1".bed |wc -l)
+    
+    open_D6=$(cat ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/D6/"$i" |sed 's/,/\t/g' |cut -f 2)
+    nsig_D6=$(cat ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/Bilan_Call/PIQ_CALL_IDR_D6_"$mark1".bed |wc -l)
+    
+    echo "$mark1 $open_D0 $nsig_D0 $open_D1 $nsig_D1 $open_D2 $nsig_D2 $open_D3 $nsig_D3 $open_D4 $nsig_D4 $open_D6 $nsig_D6" >> ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/BILAN_ALL_ATAC_2.txt
+    
+done
+    
+##--> Generate a global .bed file for each time point
+
+for day in ${days[@]}; do
+
+    echo $day;
+    
+    for i in $(ls --color=never ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/"$day"/ | grep "chropen.txt"); do
+    
+      mark1=$(echo $i | sed 's/-chropen.txt//g') ;
+      mark2=$(echo $mark1 | sed 's/.*-//g') ;
+    
+      cat ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/Bilan_Call/PIQ_CALL_"$day"_"$mark1".bed \
+      | awk -v mark=$mark2 '{OFS = "\t"};{print $1, $2, $3, mark, $4, $5, $6, $7}' \
+       >> ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/Bilan_Call/PIQ_CALL_ALL_TF_"$day".bed.tmp ;
+    
+    done
+    
+    bedtools sort -i ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/Bilan_Call/PIQ_CALL_ALL_TF_"$day".bed.tmp > \
+      ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/Bilan_Call/PIQ_CALL_ALL_TF_"$day".bed
+    rm ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/Bilan_Call/PIQ_CALL_ALL_TF_"$day".bed.tmp ;
+    bgzip ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/Bilan_Call/PIQ_CALL_ALL_TF_"$day".bed
+    tabix ./Data/5-FOOTPRINTING/PIQ/ATAC_Matches/Bilan_Call/PIQ_CALL_ALL_TF_"$day".bed.gz ;
+    
+done
+
+
+##--> Compute statistics
+
+days=(D0 D1 D2 D3 D4 D6)
+
+for day in ${days[@]}; do
+    for i in $(cat ~/bin/Tools/PIQ/pwms/jaspar_eukaryotes_519_TF.txt | grep ">" | sed 's/_.*//g' |sed 's/>//g'); do
+        echo "Rscript ~/bin/Scripts/PIQ_COI.R $i $day" >> ./Scripts/PIQ_COI.txt ;
+    done
+done
+
+qarray \
+    -q ono \
+    -cwd \
+    -V \
+    -l mem_rsvd=32G \
+    -N PIQ_COI \
+    -e ./Std_Output/5-PIQ/ \
+    -o ./Std_Output/5-PIQ/ \
+    ./Scripts/PIQ_COI.txt
+    
+    
+```
+
+## Experimental validation
+
+To compare PIQ prediction with RELA, JUN and FOSL2 ChIP-seq data, we first used the approach suggested in (Sherwood et al., 2014), computing how many of the total ChIP-seq peaks are overlapping with any potential factor motif (since ChIP-Seq peaks can result from co-factor binding, and methods such as DGF are factor agnostic). We then used a more sophisticated approach aiming at correlating the ChIP-seq signal intensity with the bound / unbound status at PWM matches. For a given transcription factor (RELA, JUN or FOSL2), we first considered all the PWM matches located inside ATAC-seq reproducible peaks, we selected all the PWM matches assigned with a purity score > 0.7 (the threshold used to define “bound” instances), and then randomly selected 3 times more PWM matches assigned with a purity score < 0.7 (considered as “unbound” instances) to obtain a global set containing 25% / 75% of bound / unbound instances for each TF. The selected regions were extended up to 2kb (1kb in each direction, from the middle of the match), and the 2kb intervals were binned in 100 20bp windows. We computed the normalized ChIP-seq and ATAC-seq signal inside each bin. The windows were finally ranked according to the summed ChIP-seq signal in the 10 most central bins (200bp). We finally run a functional enrichment analysis to assess whether bound / unbound PWM matches were enriched / depleted along this ranking and computed the enrichment score (ES, positive when bound instances are enriched for highest ChIP-seq signals, negative when unbound instances are depleted for highest ChIP-seq signals) and q-values which revealed the strength of the correlation.
+
+### Overview of the data
+
+The table below summarize the information relative to the TF ChIP-seq data anlayzed in the scope of this study. The information given are :
+
+* *Time point* : T0 - before induction of RAS , 72h after induction or 144h induction),
+* *Type* : type of the library (input, H3K4me1, H3K4me3, H3K27ac or H3K27me3),
+* *Replicate* : there are two replciates per codition,
+* *SRA* : Sequence Read Archive accession number,
+* *Raw reads* : total number of reads for each library before any processing,
+* *Clean reads* : number of reads remaining after quality filtering and adapter triming,
+* *Uniquely mapped* : number of unambiguously mapped reads,
+* *Non duplicated* : number of reads after filter for PCR / optical duplicates,
+* *Not in BLR* : number of reads mapped outside hg19 ENCODE blacklisted regions (BLR),
+* *% kept* : percentage of reads kept for subsequent analysis after filtering,
+* *% duplicates* : percentage of PCR / optical duplicates,
+* *% BLR* : percentage of reads mapped in BLR.
+
+```{r, results= "asis", echo = FALSE}
+library(dplyr)
+library(knitr)
+library(kableExtra)
+info_chipseq <- read.table("./data/ChIP-seq/ChIP-seq_TF_data_info.txt", header = TRUE, sep ="\t")
+
+kable(info_chipseq, ,
+              col.names = c("Time point", "Type", "Replicate", "SRA",
+                             "Raw reads (N)", "Clean reads (N)", "Uniquely mapped (N)",
+                              "Non duplicated (N)", "Not in BLR (N)", "% kept",
+                              "% duplicates", "% in BLR")) %>%
+kable_styling("striped", full_width = TRUE, font_size = 9, position = "left") %>%
+  collapse_rows(columns = 1:2, valign = "top")
+
+```
+
+
+### Preprocessing of TF ChIP-seq data
+
+All the TF ChIP-seq data were processed using the workflow written in *bash* describe in the Appendix 2 and ran on a Unix cluster driven by Sun Gride Engine. The different steps we described bellow are :
+
+* quality check on raw reads with [fastQC 0.11.5](https://www.bioinformatics.babraham.ac.uk/projects/fastqc/),
+* read trimming and cleaning with [fastq-mcf 1.04.803](https://github.com/ExpressionAnalysis/ea-utils/tree/wiki),
+* check for contaminations with [fastq-screen 0.4.4](https://www.bioinformatics.babraham.ac.uk/projects/fastq_screen/),
+* alignment with [bowtie 1.1.1](http://bowtie-bio.sourceforge.net/index.shtml),
+* de-duplication with [PicardTools 1.130](https://broadinstitute.github.io/picard/),
+* filtering of reads aligned in [Encode blaclisted regions](https://sites.google.com/site/anshulkundaje/projects/blacklists) with [bedtools 2.19.1](http://bedtools.readthedocs.io/en/latest/),
+* sorting and filtering of alignments with [samtools 1.6](http://samtools.sourceforge.net),
+* cross-correlation computation with [spp](https://github.com/kundajelab/phantompeakqualtools),
+* peak calling with [MACS 2.1.0](https://github.com/taoliu/MACS),
+* irreproducible discovery rate computation with [idr](https://sites.google.com/site/anshulkundaje/projects/idr).
+
+Briefly, in this workflow, reads are cleaned and trimmed using fastq-mcf from the ea-utils suite v1.1.2 to remove adapters, low quality bases and reads, and discard reads shorter than 25 bp after filtering. Reads are then aligned to the human reference genome (hg19) with bowtie v1.1.1using best matches parameters (bowtie -v 2 -m 1 --best --strata). Alignment files are further processed with samtools v1.2 and PicardTools v1.130 to flag PCR and optical duplicates and remove alignments located in Encode blacklisted regions. Fragment size is estimated *in silico* for each library using spp v1.10.1. Enriched regions are identified for each replicate independently with MACS v2.1.0 with non-IPed genomic DNA as a control (macs2 callpeak --nomodel --shiftsize --shift-control --gsize hs -p 1e-1). These relaxed peak lists are then processed through the irreproducible discovery rate (IDR) pipeline to generate an optimal and reproducible set of peaks for each histone modification type and each time point.
+
+### Compare PIQ with ChIP-seq
+
+```{r}
+##--> Loading libraries
+library(circlize)
+library(limma)
+library(plotrix)
+library(gplots)
+library(ComplexHeatmap)
+library(rtracklayer)
+library(fgsea)
+
+compare_piq_chipseq <- function(tf, pwm, day) {
+  
+  ##--> Import ATAC-seq goldstandard peakset
+  atacseq_gold <- import("./data/ATAC-seq/GOLDSTANDARD_ATACSEQ_ALL_DAY_IDR.bed")
+  
+  ##--> Import PIQ prediction
+  root <- paste("./data/PIQ/RAW/", day, sep = "")
+  piq_file <- list.files(path = root, pattern = "-calls.all.csv", full = TRUE)
+  piq_file <- piq_file[grep(pwm, piq_file)]
+  
+  piq_call  <- do.call("rbind", lapply(piq_file, function(x) read.csv(x)))[,c(2,3,3,7)]
+  colnames(piq_call) <- c("chr", "start", "end", "affinity")
+  piq_call <- GRanges(piq_call)
+  piq_call <- piq_call[-which(seqnames(piq_call) == "chrY" |seqnames(piq_call) == "chrX")]
+  
+  ##--> Select PWM matches in ATAC-seq peaks
+  # and with an affinity score > 0.7 (bound sites)
+  piq_call_1 <- subsetByOverlaps(piq_call, atacseq_gold)[which(subsetByOverlaps(piq_call, atacseq_gold)$affinity > .7)]
+  
+  ##--> Select randomnly 3 time more PWM matches 
+  # with an affinity < 0.7 (unbound sites)
+  piq_call_2 <- sample(piq_call[piq_call$affinity < .7], length(piq_call_1)*3)
+  
+  ##--> Fuse the two sets of PWM matches and format
+  call <- unique(c(piq_call_1, piq_call_2)  + 1000)
+  call <- call[rev(order(call$affinity))]
+  
+  ##--> Bin ChIP-seq peak 
+  tile = 100
+  call_split <- tile(call, n = tile)
+  call_split <- unlist(call_split)
+  
+  ##--> Import normalized BigWig files for ChIP-seq and ATAC-seq
+  bw_chipseq <- list.files("./data/ChIP-seq/",
+                           pattern = paste(tf, ".bw", sep = ""),
+                           full.names = TRUE)
+  bw_atacseq <- list.files(path ="./data/ATAC-seq/",
+                           pattern = paste(day, ".bw", sep = ""),
+                           full = TRUE)
+  bw <- c(bw_chipseq, bw_atacseq)
+  
+  ##--> Compute signals in bound and unbound PWM matches peaks
+  counts <- matrix(NA, nrow = length(call_split), ncol = length(bw))
+  
+  for(i in c(1 : length(bw))) {
+    print(i)
+    coverage <- import(bw[i], as = 'RleList')
+    
+    for(chr in unique(seqnames(call_split))) {
+      
+      counts[which(seqnames(call_split) == chr) , i] <- mean(Views(coverage[[which(names(coverage) == chr)]],
+                                                                   ranges(call_split[seqnames(call_split) == chr])))
+      
+    }
+  }
+  
+  ##--> Transform into matrix
+  count_list <- list()
+  count_list[[1]] <- t(matrix(counts[,1], nrow = tile))
+  count_list[[2]] <- t(matrix(counts[,2], nrow = tile))
+  
+  ##--> Ordering according to ChIP-seq signal around PWM match
+  order  <- rev(order(rowSums(count_list[[1]][,c(45:55)])))
+  order <- setdiff(order, which(rowSums(count_list[[1]] [,c(45:55)])==0))
+  
+  
+  ##--> Defining the color scheme
+  color_1 <- colorRamp2(seq(from = quantile(unlist(count_list[[1]]), probs = seq(0, 1, 0.05),na.rm = TRUE)[4],
+                            to =   quantile(unlist(count_list[[1]]), probs = seq(0, 1, 0.05),na.rm = TRUE)[20],
+                            length.out = 30),
+                        smoothColors("#356FB2",28,"#EBE517"))
+  color_2 <- colorRamp2(seq(from = quantile(unlist(count_list[[2]]), probs = seq(0, 1, 0.05),na.rm = TRUE)[4],
+                            to =   quantile(unlist(count_list[[2]]), probs = seq(0, 1, 0.05),na.rm = TRUE)[20],
+                            length.out = 30),
+                        smoothColors("#356FB2",28,"#EBE517"))
+  
+  ##--> Defining annotation
+  split <- data.frame(Affinity = call$affinity[order])
+  split$State <- rep("UNBOUND", length(split))
+  split$State[which(split$Affinity > .7)] <- "BOUND"
+  split_1 <- split$State
+  split_2 <- ComplexHeatmap::rowAnnotation(df = data.frame(Change = split_1), 
+                                           col = list(Change = c("UNBOUND" =  "firebrick1", "BOUND" = "chartreuse3")),
+                                           width = unit(.3, "cm"),
+                                           show_legend = FALSE)
+  
+  ##--> Customized heatmap function
+  heatmap_custom <- function(x, y) {
+    
+    Heatmap(x, cluster_rows = FALSE,
+            cluster_columns = FALSE,
+            gap = unit(0, "mm"),
+            col = y,
+            combined_name_fun = NULL,
+            show_heatmap_legend = FALSE)
+    
+  } 
+  
+  ##--> Build the ComplexHeatmap objects
+  heatmap_piq <- split_2 + 
+    heatmap_custom(count_list[[1]][order,], color_1) +
+    heatmap_custom(count_list[[2]][order,], color_2)
+  heatmap_piq <- grid.grabExpr(draw(heatmap_piq))
+  
+  ##--> Set enrichment analysis
+  
+  # Compute summed ChIP-seq signal at PWM match
+  chipseq_signal <- rowSums(count_list[[1]][,c(45:55)])[order]
+  names(chipseq_signal) <- c(1:length(chipseq_signal))
+  
+  # Correlate "bound" status and ChIP-seq signal with SEA
+  piq_bound <- split$State
+  piq_bound <- list(BOUND = as.character(which(piq_bound == "BOUND")))
+  fsea_bound <- fgsea(pathways = piq_bound,
+                      stats = chipseq_signal,
+                      nperm = 1000,
+                      minSize = 1,
+                      maxSize = Inf)
+  fsea_bound_plot <- plotEnrichment(piq_bound$BOUND, chipseq_signal)
+  
+  # Correlate "unbound" status and ChIP-seq signal with SEA
+  piq_unbound  <- split$State
+  piq_unbound  <- list(UNBOUND = as.character(which(piq_unbound == "UNBOUND")))
+  fsea_unbound <- fgsea(pathways = rev(piq_unbound ),
+                        stats = rev(chipseq_signal),
+                        nperm = 1000,
+                        minSize = 1,
+                        maxSize = Inf)
+  fsea_unbound_plot <- plotEnrichment(piq_unbound$UNBOUND, chipseq_signal)
+  
+  # FSEA histogram
+  fsea_combine_hist <- data.frame(Rank = c(1:length(split$State)) ,
+                                  Type = as.numeric(as.factor(split$State)))
+  fsea_combine_hist$Type <- factor(fsea_combine_hist$Type,
+                                   labels = c("Bound", "Unbound"))
+  
+  fsea_hist <- ggplot(fsea_combine_hist, aes(x = Rank, group = Type)) + 
+    geom_histogram(aes(group=Type, colour=Type, fill=Type),
+                   alpha = 0.6, bins = 100, position = "fill") +
+    theme_bw() + 
+    scale_color_manual(values = c("firebrick1", "chartreuse3")) +
+    scale_fill_manual(values = c("firebrick1", "chartreuse3")) +
+    scale_x_reverse() + scale_y_reverse() + coord_flip() +
+    theme(legend.position="none")
+  
+  # FSEA enrichment plot
+  fsea_combine_plot <- rbind(fsea_bound_plot$data, fsea_unbound_plot$data)
+  fsea_combine_plot$Type <- c(rep("BOUND", nrow(fsea_bound_plot$data)),
+                              rep("UNBOUND", nrow(fsea_unbound_plot$data)))
+  fsea_plot <- ggplot(fsea_combine_plot, aes(x=x, y=y, color = Type)) +
+    geom_line() +
+    theme_bw()  +
+    scale_color_manual(values = c("firebrick1", "chartreuse3")) +
+    coord_flip() + scale_x_reverse()  + theme(axis.title.y=element_blank()) +
+    ylab("GSEA enrichment")
+  
+  return(list(heatmap_piq, fsea_plot, fsea_hist))
+
+}
+
+rela_comp <- compare_piq_chipseq("RELA", "RELA", "144H")
+jun_comp <- compare_piq_chipseq("JUN", "JUNB", "144H")
+fosl2_comp <- compare_piq_chipseq("FOSL2", "FOSL2", "144H")
+```
+
+```{r, fig.cap="Comparison between PIQ prediction and ChIP-seq for RELA, JUN and FOSL2"}
+##--> RELA
+grid.arrange(rela_comp[[3]], rela_comp[[1]], rela_comp[[2]],
+             nrow = 1,
+             top = textGrob("RELA - Comparison PIQ vs ChIP-seq"))
+
+##--> JUN
+grid.arrange(jun_comp[[3]], jun_comp[[1]], jun_comp[[2]],
+             nrow = 1,
+             top = textGrob("JUN - Comparison PIQ vs ChIP-seq"))
+
+##--> FOSL2
+grid.arrange(fosl2_comp[[3]], fosl2_comp[[1]], fosl2_comp[[2]],
+             nrow = 1,
+             top = textGrob("FOSL2 - Comparison PIQ vs ChIP-seq"))
+```
+
+# TF footprint characterization
+
+## Computation of TF metrics
+
+For each transcription factor, we computed the chromatin opening index, the motif dependence and the chromatin dependence as described in (Sherwood et al., 2014).
+
+* The chromatin opening index is defined as the expected change in reads at bound occurrences with respect to baseline at $j^{th}$ binding site for the the transcription factor $m$ , in the experiment $k$, with $c_i^k$ the number of ATAC-seq read at the base $i$ in the experiment $k$, $p_j^k$ the PIQ estimated binding probability at site $j$, $x_j$ the coordinate of binding site $j$, and $S_m$ the set of binding sites for transcription factor $m$. It is defined as 
+
+$$p_m= \frac{1}{399 k} \sum_{i=-199}^{199} \sum_{k} \left( \frac{\sum_{j\in S_m}c^{k+1}_{x_{j+i}}*p^k_i}{\sum_{j\in S_m}c^{k+1}_{x_{j+i}}*\left(1-p^k_i\right)} \right)$$ 
+
+* The motif dependence of a factor $m$ is defined as the Pearson’s correlation between the logistic binding probability and the PWM score $z$ at site $j$, defined as 
+
+$$ b_m = cor(logit(p^k_j), z_j)$$
+
+* The chromatin dependence is defined as the Pearson’s correlation between logistic binding and the log number of ATAC-seq reads within a 399 bp window, computed as 
+
+$$ c_m = cor(logit(p^k_j * log(\sum_{i=-199}^{199} c^{k}_{x_{j+i}})$$
+
+**NB:** To compute these metrics, we used the R script described in the following chunk which is not evaluated here to avoid computationnal burden. To rerun the analysis, we advise to create a stand-alone R script containing the following code chunk and execute computations from the terminal using the `Rscript` command. This script take as an input the JASPAR PWM ID (*e.g.*: MA0911.1) and the time point reference (*e.g.*: D0).
+
+```{r, eval = FALSE}
+#--> Loading libraries
+library(GenomicRanges)
+library(GenomicAlignments)
+library(genomation)
+library(biovizBase)
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(gtools)
+
+#--> Input arguments
+arg  <- commandArgs(TRUE)
+arg1 <- arg[1] # e.g. MA0911.1
+arg2 <- arg[2] # D0, D1, ..., D6
+arg1 <- gsub("\\.", "", arg1)
+print(Arg1)
+
+#--> Import de JASPAR DB
+
+importJaspar <- function(file=myloc) {
+  vec <- readLines(file)
+  vec <- gsub("\\[|\\]", "", vec)
+  start <- grep(">", vec); end <- grep(">", vec) - 1
+  pos <- data.frame(start=start, end=c(end[-1], length(vec)))
+  pwm <- sapply(seq(along=pos[,1]), function(x) vec[pos[x,1]:pos[x,2]])
+  pwm <- sapply(seq(along=pwm), function(x) gsub( "^ *|(?<= ) | *$", "", pwm[[x]], perl = TRUE))
+  pwm <- sapply(seq(along=pwm), function(x) strsplit(pwm[[x]], " "))
+  pwm <- sapply(seq(along=start), function(x) matrix(as.numeric(t(as.data.frame(pwm[(pos[x,1]+1):pos[x,2]]))[,-1]),nrow=4, dimnames=list(c("A", "C", "G", "T"), NULL)))
+  names(pwm) <- gsub(">", "", vec[start])
+  return(pwm)
+}
+
+pwm <- importJaspar(file="./tools/jaspar_eukaryotes_519_TF_PIQ_FORMATED.txt")
+
+#--> Setups = PWM information
+names <- names(pwm)
+id <- gsub("\\.", "", gsub("_.*", "", names))  # format PWM names
+id_target <- gsub("\\.", "", gsub("_.*", "", arg1))
+id_pos <- grep(id_target , id)                 # get the position of the analyzed PWM on the JASPAR DB
+id_length <- round(dim(pwm[[id_pos]])[2]/2)*2  # get the size of the PWM
+
+#--> Setups = paths to data
+root <- "/data/PIQ/ORIGINAL/"
+root <- paste(root, arg2, "", sep = "")
+
+#--> Import PIQ CSV files with coordinates and statistics for candidate sites
+piq_call_files <- list.files(path = root, pattern = "-calls.all.csv", full = TRUE)
+piq_call <- read.csv(piq_call_files[grep(id_target, piq_call_files)[1]], sep = ",")[,-1]
+
+#--> Reformat target name
+id_2 <- gsub("^.*_", "", names)
+id_target <- id_2[match(id_target, id)]
+
+#--> Convert the table to GRanges
+piq_call_gr <- GRanges(seqnames = piq_call$chr, IRanges(start = piq_call$coord, end = piq_call$coord))
+piq_call_gr$PWM <- piq_call$pwm
+piq_call_gr$PIQ_purity <- piq_call$purity
+
+#--> Resize PWM hits
+piq_call_gr <- piq_call_gr + 199
+
+#--> Identify the top 10000 hits based on FIMO score 
+piq_call_gr_sel <- order(-piq_call_gr$PWM)[1:min(10000, length(piq_call_gr$PWM))]
+
+#--> Split selected hits in 1bp windows
+piq_call_gr_split <- tile(piq_call_gr, n = width(piq_call_gr)[1]) 
+piq_call_gr_split <- flatGrl(piq_call_gr_split)
+
+#--> Setup input bam file
+bam_root <- c("./data/ATAC-seq/")
+bam <- c(paste(bam_root,"RASOIS_ATACSEQ_T0_REP1.bam", sep = ""),
+         paste(bam_root,"RASOIS_ATACSEQ_T0_REP2.bam", sep = ""),
+         paste(bam_root,"RASOIS_ATACSEQ_T0_REP3.bam", sep = ""))
+target_ranges <- piq_call_gr
+
+#--> Import bam files (split FW and RV reads)
+param_FW <- ScanBamParam(what = "pos",
+                         which = piq_call_gr + 20000,
+                         scanBamFlag(isMinusStrand = FALSE))
+param_RV <- ScanBamParam(what = "pos",
+                         ,
+                         scanBamFlag(isMinusStrand = TRUE))
+
+#--> Import alignments 
+reads_FW <- GRanges(unlist(GAlignmentsList(bplapply(bam,
+                                                    readGAlignments,
+                                                    BPPARAM = MulticoreParam()))))
+reads_RV <- GRanges(unlist(GAlignmentsList(bplapply(bam,
+                                                    readGAlignments,
+                                                    BPPARAM = MulticoreParam()))))
+
+#--> Shift and resize alignements to focus on Tn5 cut sites
+reads_FW <- GRanges(seqnames = seqnames(reads_FW),
+                    IRanges(start = start(reads_FW),
+                            end = end(reads_FW)),
+                    strand = strand(reads_FW))
+reads_RV <- GRanges(seqnames = seqnames(reads_RV),
+                    IRanges(start = start(reads_RV),
+                            end = end(reads_RV)),
+                    strand = strand(reads_RV))
+bases_FW <- shift(resize(reads_FW, 1), -4)
+bases_RV <- shift(resize(reads_RV, 1), -4)
+
+#--> Generate binding profiles for bound sites (FW)
+count_test_FW <- summarizeOverlaps(piq_call_gr_split,
+                                   bases_FW,
+                                   ignore.strand = FALSE,
+                                   inter.feature = FALSE)
+count_test_FW <- assay(count_test_FW)
+count_test_FW <- t(matrix(count_test_FW,
+                          ncol = dim(count_test_FW)[1] / width(piq_call_gr)[1]))
+
+#--> Generate binding profiles for bound sites (RV)
+count_test_RV <- summarizeOverlaps(piq_call_gr_split,
+                                   bases_RV,
+                                   ignore.strand = FALSE,
+                                   inter.feature = FALSE)
+count_test_RV <- assay(count_test_RV)
+count_test_RV <- t(matrix(count_test_RV,
+                          ncol = dim(count_test_RV)[1] / width(piq_call_gr)[1]))
+
+#--> Define region to compute local background for each PWM hit
+background_gr <- promoters(piq_call_gr[piq_call_gr_sel],
+                           upstream = 0,
+                           downstream = 10000) - width(piq_call_gr[piq_call_gr_sel])
+background_gr_split <- tile(background_gr, n = width(background_gr)[1])
+background_gr_split <- flatGrl(background_gr_split)
+
+#--> Define the binding profile in background regions (FW)
+count_background_FW <- summarizeOverlaps(background_gr_split,
+                                         bases_FW,
+                                         ignore.strand = FALSE,
+                                         inter.feature = FALSE)
+count_background_FW <- assay(count_background_FW)
+count_background_FW <- t(matrix(count_background_FW,
+                               ncol = dim(count_background_FW)[1] / width(background_gr)[1]))
+
+#--> Define the binding profile in background regions (FW)
+count_background_RV <- summarizeOverlaps(background_gr_split,
+                                         bases_RV,
+                                         ignore.strand = FALSE,
+                                         inter.feature = FALSE)
+count_background_RV <- assay(count_background_RV)
+count_background_RV <- t(matrix(count_background_RV,
+                               ncol = dim(count_background_RV)[1] / width(background_gr)[1]))
+
+
+#--> Compute the chromatin opening index
+count_background_sum_FW <- rowSums(count_background_FW[,10000/2 + (-199:199)])
+count_test_sum_FW <- rowSums(count_test_FW)
+count_background_sum_RV <- rowSums(count_background_RV[,10000/2 + (-199:199)])
+count_test_sum_RV <- rowSums(count_test_RV)
+
+p_rank_piq <- 1 / (1+ exp(-log(piq_call_gr$PIQ_purity) + log(1 - piq_call_gr$PIQ_purity) +1 ))
+
+coi_FW <- log(
+              (sum(count_test_sum_FW[piq_call_gr_sel] * p_rank_piq[piq_call_gr_sel]) /  sum(p_rank_piq[piq_call_gr_sel])) / 
+              (mean(count_background_sum_FW))) / log(2)
+
+coi_RV <- log(
+              (sum(count_test_sum_RV[piq_call_gr_sel] * p_rank_piq[piq_call_gr_sel]) /  sum(p_rank_piq[piq_call_gr_sel])) / 
+              (mean(count_background_sum_RV))) / log(2)
+
+PI_FW_PIQ <- log((sum(count_test_sum_FW[piq_call_gr_sel]*p_rank_piq[piq_call_gr_sel])/sum(p_rank_piq[piq_call_gr_sel]))/(mean(count_background_sum_FW)))/log(2)
+
+coi <- (coi_FW + coi_RV)*2
+
+#--> Compute the asymmetry index
+ai <- coi^2 * abs(coi_FW - coi_RV )
+
+#--> Compute the chromatin dependence
+cd <- cor(logit(p_rank_piq[piq_call_gr_sel], min = -100, max = 100),
+          (count_test_sum_FW[piq_call_gr_sel] + count_test_sum_RV[piq_call_gr_sel]))
+
+#--> Compute the motif depedence
+md <- cor(logit(p_rank_piq[piq_call_gr_sel], min = -100, max = 100),
+          piq_call_gr$PWM[piq_call_gr_sel])
+
+#--> Put all the results together and output
+res <- data.frame(Chromatin_Opening_I = c(coi),
+                  Asymmetry_I = c(zi),
+                  Chrom_Dependence = c(cd),
+                  Motif_Dependence = c(md),
+                  row.names = c("PIQ"))
+write.table(RES, paste("./data/PIQ/TF_METRICS/", paste(Arg2, ID_Target, sep = "_"), "_SI.txt", sep = ""), quote = F, row.names = T, col.names = T)
+```
+
+## Classification of TFs
+
+```{r, fig.cap="Chromatin dependence versus chromatin opening index for all motifs"}
+#--> Load libraries
+library(plyr)
+
+#--> List files with TF metrics for each PWM and each time point
+file_comp <- list.files("./data/PIQ/TF_METRICS/", pattern = "_COI.txt", full = TRUE)
+
+#--> Import data
+data_comp <- do.call("rbind",
+                     lapply(file_comp, function(fn) {
+                            data.frame(Filename=fn,
+                                       read.csv(fn,
+                                                header = FALSE,
+                                                sep= "",
+                                                skip = 1))
+                      }))
+
+colnames(data_comp) <- c("Filename", "V1", "Chromatin_Opening_I",
+                         "Asymmetry_I", "Chrom_Dependence", "Motif_Dependence")
+
+#--> Format
+name <- gsub("./data/PIQ/TF_METRICS/", "", data_comp[,1])
+name <- gsub ("_COI.txt", "", name)
+name <- gsub("D[012346]_", "", name)
+
+day <-  gsub("./data/PIQ/TF_METRICS/", "", data_comp[,1])
+day  <- gsub ("_.*_COI.txt", "", day)
+data_comp$TF <- name
+data_comp$Day <- day
+
+#--> Compute the mean of each statistcs for each TF over time point
+cd_mean <- ddply(data_comp, .(TF), summarize, mean=mean(Chrom_Dependence))
+coi_mean <- ddply(data_comp, .(TF), summarize, mean=mean(Chromatin_Opening_I))
+
+#--> Pepare data.frame
+piq_profile <- data.frame(TF = unique(name), CD = cd_mean$mean, COI = coi_mean$mean)
+
+#--> Apply empirical threshold to define migrants, settlers and pioneers
+piq_profile$Type <- ""
+piq_profile$Type[which(piq_profile$CD < 0.4)] <- "Migrants"
+piq_profile$Type[which(piq_profile$CD >= 0.4 & piq_profile$COI < 4)] <- "Settlers"
+piq_profile$Type[which(piq_profile$CD >= 0.4 & piq_profile$COI >= 4)] <- "Pioneers"
+piq_profile <- unique(piq_profile)
+piq_profile$Type <- factor(piq_profile$Type, levels = c("Pioneers", "Settlers", "Migrants"))
+
+#--> Build the chromatin opening index vs chromatin dependance plot
+ggplot(piq_profile, aes(x = CD, y = COI, color = Type, group = Type)) + 
+  geom_point(size = 1) +
+  xlab("PIQ motif dependence") +
+  ylab("PIQ chromatin opening index")  +
+  scale_colour_manual(values = c("#4682B4", "#FF3030", "#A2CD5A")) +
+  geom_hline(yintercept = 4, linetype  = "dashed") +
+  geom_vline(xintercept = 0.4, linetype  = "dashed") +
+  theme_classic()
+```
+
+## Metaprofiles around TF binding sites
+
+### Create a function to build Tn5 and nucleosome metaprofiles
+
+```{r}
+
+tf_metaprofiles <- function(pwm_id, day) {
+
+  ##--> Format PWD ID
+  pwm_id <- gsub("\\.", "", pwm_id)
+  
+  ##--> Build function to import JASPAR DB
+  importJaspar <- function(file=myloc) {
+    vec <- readLines(file)
+    vec <- gsub("\\[|\\]", "", vec)
+    start <- grep(">", vec); end <- grep(">", vec) - 1
+    pos <- data.frame(start=start, end=c(end[-1], length(vec)))
+    pwm <- sapply(seq(along=pos[,1]), function(x) vec[pos[x,1]:pos[x,2]])
+    pwm <- sapply(seq(along=pwm), function(x) gsub( "^ *|(?<= ) | *$", "", pwm[[x]], perl = TRUE))
+    pwm <- sapply(seq(along=pwm), function(x) strsplit(pwm[[x]], " "))
+    pwm <- sapply(seq(along=start), function(x) matrix(as.numeric(t(as.data.frame(pwm[(pos[x,1]+1):pos[x,2]]))[,-1]),nrow=4, dimnames=list(c("A", "C", "G", "T"), NULL)))
+    names(pwm) <- gsub(">", "", vec[start])
+    return(pwm)
+  }
+  
+  ##--> Import JASPAR DB
+  pwm <- importJaspar(file="./tools/jaspar_eukaryotes_519_TF_PIQ_FORMATED.txt")
+  names <- names(pwm)
+  
+  ##--> Get information on the pwm (TF names, motif length)
+  id <- gsub("\\.", "", gsub("_.*", "", names))
+  id_target <- pwm_id
+  id_pos <- match(id_target, id)
+  id_length <- round(dim(pwm[[id_pos]])[2]/2)*2
+  
+  ##--> Set up the path to access PIQ .bed files
+  root <- "./data/PIQ/ORIGINAL/"
+  bed_files <- list.files(path = root , pattern =   paste(".*_IDR_", "D0", ".*.bed", sep = ""), full = T)
+  
+  ##--> Process the candidate binding sites
+  call  <- read.table(bed_files[grep(id_target, bed_files)[1]])
+  call_gr <- GRanges(seqnames = as.character(call[,1]), 
+                     IRanges(start =call[,2] - (500 + id_length/2 - 1),
+                             end = call[,2] + (500 + id_length/2)))
+  call_split <- tile(call_gr, n = width(call_gr)[1])
+  call_split <- flatGrl(call_split)
+  
+  ##--> Convert PWM ID to HGNC
+  id_hgnc <- gsub("^.*_", "", names)
+  id_hgnc_tf <- id_hgnc[match(id_target, id)]
+  
+  ##--> List .bam files
+  bam_root <- c("./data/ATAC-seq/")
+  bam <- c(paste(bam_root,"RASOIS_ATACSEQ_",day,"_REP1.bam", sep = ""),
+           paste(bam_root,"RASOIS_ATACSEQ_",day,"_REP2.bam", sep = ""),
+           paste(bam_root,"RASOIS_ATACSEQ_",day,"_REP3.bam", sep = ""))
+  
+  param_FW <- ScanBamParam(what = "pos",
+                           scanBamFlag(isMinusStrand = F),
+                           which = call_gr + 1000)
+  param_RV <- ScanBamParam(what = "pos", scanBamFlag(isMinusStrand = T),
+                           which = call_gr + 1000)
+  
+  ##--> Prepare environment for storing aligments
+  count_FW_all_piq <- list()
+  count_RV_all_piq <- list()
+  count_FW_all_plot <- list()
+  count_RV_all_plot <- list()
+  
+  bases_FW_all <- list()
+  bases_RV_all <- list()
+  
+  ##--> Import alignments 
+  reads_FW <- GRanges(unlist(GAlignmentsList(bplapply(bam,
+                                                      readGAlignments,
+                                                      BPPARAM = MulticoreParam()))))
+  reads_RV <- GRanges(unlist(GAlignmentsList(bplapply(bam,
+                                                      readGAlignments,
+                                                      BPPARAM = MulticoreParam()))))
+  
+  reads_FW <- GRanges(seqnames = seqnames(reads_FW),
+                      IRanges(start = start(reads_FW),
+                              end = end(reads_FW)),
+                      strand = strand(reads_FW))
+  
+  reads_RV <- GRanges(seqnames = seqnames(reads_RV),
+                      IRanges(start = start(reads_RV),
+                              end = end(reads_RV)),
+                      strand = strand(reads_RV))
+  
+  ##--> Shift and resize to focuse on the 5' end (Tn5 cuts)
+  bases_FW <- GenomicRanges::shift(GenomicRanges::resize(reads_FW, 1),-4)
+  bases_FW_all <- bases_FW
+  bases_RV <- GenomicRanges::shift(GenomicRanges::resize(reads_RV, 1),-4)
+  bases_RV_All <- bases_RV
+  
+  ##--> Select bound PWM occurences
+  bound_all_RV <- list()
+  bound_all_FW <- list()
+  n_bound <- list()
+  
+  count_bound_FW <- summarizeOverlaps(call_split, bases_FW_all, yieldSize = 100000, ignore.strand = F, inter.feature = FALSE)
+  count_bound_FW <- matrix(assay(count_bound_FW), ncol = width(call_gr)[1], byrow = TRUE)
+  count_bound_RV <- summarizeOverlaps(call_split, bases_RV_All, yieldSize = 100000, ignore.strand = F, inter.feature = FALSE)
+  count_bound_RV <- matrix(assay(count_bound_RV), ncol = width(call_gr)[1], byrow = TRUE)
+  
+  ##--> Define a quantile threshold
+  thresh_1 <- max(quantile(cbind(count_bound_RV, count_bound_FW), 0.999), 1L)
+  cuts_1 <- pmin(cbind(count_bound_RV, count_bound_FW), thresh_1 )
+  
+  ##--> Subset and format the data
+  count_bound_FW <- cuts_1[,c(1:(ncol(cuts_1)/2))]
+  count_bound_RV <- cuts_1[,c(((ncol(cuts_1)/2+1) : ncol(cuts_1)))]
+  count_bound_FW_2  <- count_bound_FW[,c((1):(500 + id_length))]
+  count_bound_RV_2  <- count_bound_RV[,c(501:(1000 + id_length))]
+  
+  ##--> Compute aveage Tn5 cut profiles
+  mean_bound_FW <- apply(count_bound_FW_2 , 2, mean)
+  mean_bound_RV <- apply(count_bound_RV_2, 2, mean)
+  
+  ##--> Formating for ggplot
+  mean_cut <- data.frame(Count = c(mean_bound_FW, mean_bound_RV),
+                         Distance = rep(c(seq(-500 - id_length/2 + 1, id_length/2),
+                                          seq(-id_length/2 + 1 ,500 + id_length/2))),
+                         Type = c(rep("Bound", length(c(unlist(mean_bound_FW))) +
+                                        length(c(unlist((mean_bound_RV)))))),
+                         Strand = c(rep("FW", length(unlist(mean_bound_FW))),
+                                    rep("RV", length(unlist(mean_bound_RV)))))
+  
+  labels <-  c(paste(day, " (N=", length(call_gr), ")", sep = ""))
+  
+  ##--> Tn5 cut profile
+  plot_cut <- ggplot(mean_cut, aes(x = Distance, y = Count, group = Strand, color = Strand)) +
+    geom_line(aes(colour= Strand), size = .3) + 
+    theme_bw() +
+    scale_color_manual(values=c("grey60", "grey10")) +
+    theme(legend.position="none") +
+    ggtitle(paste(id_target, "Average Tn5 insertion profil \n (Bound vs Unbound according to PIQ)", sep = " - "))
+  
+  
+  ##--> Import nucleosome density track
+  bw_nuc <- paste(bam_root,"RASOIS_ATACSEQ_",day,"_REP123_NUCLEO_OCC.bw", sep = "")
+  
+  ##--> Compute nucleosome occupancy around bound instances 
+  count_nuc <- matrix(NA, nrow = length(call_split), ncol = 1)
+  chrs <- c(paste("chr", seq(1, 22), sep = ""))
+  
+  coverage <- import(bw_nuc, as = 'RleList')
+  
+  for(chr in chrs) {
+    count_nuc[which(seqnames(call_split) == chr) , 1] <-
+      mean(Views(coverage[[which(names(coverage) == chr)]], ranges(call_split[seqnames(call_split) == chr])))
+  }
+  
+  ##--> Format nucleosome occupancy matrix
+  count_nuc_2  <- t(matrix(count_nuc[,1], nrow = length(call_split) / length(call_gr)))
+  count_nuc_mean <- colMeans(count_nuc_2, na.rm = TRUE)
+  
+  ##--> Formating for ggplot
+  count_nuc_mean <- data.frame(Nuc = c(unlist(count_nuc_mean)), 
+                               Distance = ((-500 - id_length/2  ) : (500 + id_length/2 - 1)))
+  
+  ##--> Ncleosome density profile
+  plot_nuc <- ggplot(count_nuc_mean, aes(x = Distance, y = Nuc)) +
+    geom_smooth(color = "orange", size = 2, level = .99) +
+    theme_bw()
+  
+  metaplot <-  plotflow::ggdual_axis(plot_cut,plot_nuc)
+  return(metaplot)
+}
+
+meta_FOSL1 <- tf_metaprofiles("MA04771", "T0")
+meta_RELA <- tf_metaprofiles("MA01071", "T0")
+meta_SREBF1 <- tf_metaprofiles("MA05951", "T0")
+```
+
+### Build metaprofiles
+
+```{r, fig.cap="ATAC-seq (grey and black lines) and nucleosome (red line) profiles at the FOSL1, RELA and SREBF1 bound sites", fig.height=12}
+
+grid.arrange(meta_FOSL1, meta_RELA, meta_SREBF1, ncol = 1)
+
+```
+
+
+## Exploration of the TF landscape
+
+Using the package `r Biocpkg("annotatr")` we first created an annotation datasets combining coordinates for *hg19* promoters, 3’UTRs, exons, introns and intergenic regions as defined in UCSC, as well as our custom set of enhancers (intersection of the global sets of reproducible H3K4me1 peaks with global sets of reproducible H3K27ac peaks, to focus on enhancers that are active at least in one time point during RAS OIS in WI38 fibroblasts). We then annotated the PIQ binding occurrences for each of the PWM independently, and for the 6 time-points independently. Data were further normalized, to account for differences between time-points in the total number of bound occurrences summed across PWM, and finally they were converted to frequencies. We filtered TFs for which less than 100 binding sites were identified throughout the entire timecourse. TFs were ordered according to the proportions of binding sites located in promoters, introns or exons, and we finally computed the density in migrant, settler and pioneer factors along the ranking.
+
+### Build the annotation set
+
+```{r}
+##--> Load libraries
+library(GenomicRanges)
+library(annotatr)
+library(plyr)
+library(reshape)
+library(ggplot2)
+library(rtracklayer)
+
+##--> Create a function to import JASPAR DB
+importJaspar <- function(file=myloc) {
+  vec <- readLines(file)
+  vec <- gsub("\\[|\\]", "", vec)
+  start <- grep(">", vec); end <- grep(">", vec) - 1
+  pos <- data.frame(start=start, end=c(end[-1], length(vec)))
+  pwm <- sapply(seq(along=pos[,1]), function(x) vec[pos[x,1]:pos[x,2]])
+  pwm <- sapply(seq(along=pwm), function(x) gsub( "^ *|(?<= ) | *$", "", pwm[[x]], perl = TRUE))
+  pwm <- sapply(seq(along=pwm), function(x) strsplit(pwm[[x]], " "))
+  pwm <- sapply(seq(along=start), function(x) matrix(as.numeric(t(as.data.frame(pwm[(pos[x,1]+1):pos[x,2]]))[,-1]),nrow=4, dimnames=list(c("A", "C", "G", "T"), NULL)))
+  names(pwm) <- gsub(">", "", vec[start])
+  return(pwm)
+}
+
+##--> Import JASPAR PWM and list TFs
+pwm <- importJaspar(file="./tools/jaspar_eukaryotes_519_TF_PIQ_FORMATED.txt")
+names <- names(pwm)
+
+##--> Set path to ChIP-seq and PIQ data
+root_chip <- "./data/ChIP-seq/"
+root_piq <- "./data/PIQ/ORIGINAL/"
+
+##--> Define K4Me1 positive regions at any given time point
+chip_H3K4me1 <- list.files(path = root_chip,
+                           full.names = TRUE,
+                           pattern = "H3K4me1_MACS2_OPTIMAL_IDR.bed")
+chip_H3K4me1 <- lapply(chip_H3K4me1, read.table)
+chip_H3K4me1 <- GRangesList(lapply(chip_H3K4me1, function(x) {
+                                     GRanges(seqnames = x$V1, IRanges(x$V2, x$V3))}))
+chip_H3K4me1 <- lapply(chip_H3K4me1, GenomicRanges::reduce)
+
+##--> Define K27Ac positive regions at any given time point
+chip_H3K27ac <- list.files(path = root_chip,
+                           full.names = TRUE,
+                           pattern = "H3K27ac_MACS2_OPTIMAL_IDR.bed")
+chip_H3K27ac <- lapply(chip_H3K27ac, read.table)
+chip_H3K27ac <- GRangesList(lapply(chip_H3K27ac, function(x) {
+                                     GRanges(seqnames = x$V1, IRanges(x$V2, x$V3))}))
+chip_H3K27ac <- lapply(chip_H3K27ac, GenomicRanges::reduce)
+
+##--> Define set of active enhancers
+# as the overlap between H3K4me1 and H3K27ac at a given time point
+active_enhancers <- reduce(unlist(GRangesList(GenomicRanges::intersect(chip_H3K4me1[[1]], chip_H3K27ac[[1]]),
+                                              GenomicRanges::intersect(chip_H3K4me1[[2]], chip_H3K27ac[[2]]),
+                                              GenomicRanges::intersect(chip_H3K4me1[[3]], chip_H3K27ac[[3]]))))
+##--> Resize enhancers
+active_enhancers  <- active_enhancers  + 1000
+export(active_enhancers, "./data/ChIP-seq/custome_active_enhancers.bed", format = "BED")
+read_annotations(con = "./data/ChIP-seq/custome_active_enhancers.bed", name = 'enhancers', genome = 'hg19')
+
+##--> Build the annotation set
+piq_annotation_set <- build_annotations(genome = "hg19",
+                                    annotations = c("hg19_custom_enhancers", "hg19_genes_promoters",
+                                                    "hg19_genes_3UTRs", "hg19_genes_exons",
+                                                    "hg19_genes_introns", "hg19_genes_intergenic"))
+
+```
+
+### Annotate TF binding sites
+
+```{r, fig.cap="The RAS OIS TF landscape in space and time"}
+##--> Enrichment analysis over features for each time point and each TF
+
+piq_annotation_raw <- list()
+i <- 0
+
+# Loop over time-points
+for (day in c("D0", "D1", "D2", "D3", "D4", "D6")) {
+  
+  print(day)
+  i <- i + 1
+  
+  # List PIQ files corresponding to each time point
+  bed_files <- list.files(root_piq, full = TRUE, pattern = paste(".*_IDR_", day, ".*.bed", sep = ""))
+  count_feature <- data.frame(matrix(ncol = 7))
+  
+  # Loop over TFs
+  for (tf in names) {
+    
+    print(tf)
+    id <- gsub("\\.", "", tf)
+    id <- gsub("_.*", "", id)
+    
+    # Process the candidate binding sites
+    bed_file_tf <- bed_files[grep(id, bed_files)]
+    call_tf  <- adply(bed_file_tf, 1, read.table)
+    call_tf_gr <- GRanges(seqnames = call_tf [,2],
+                          IRanges(start = call_tf [,3], end = call_tf[,3]))
+    length_call_tf <- length(call_tf_gr)
+    
+    # Set annotations to zero if the TF has less than 10 binding sites ...
+    if (length_call_tf < 10) { Count_feature <- rbind(Count_feature, rep(0,6)) }
+    
+    # Else, go through the annotation process
+    if (length_call_tf >= 10) {
+      
+      call_tf_annot <- annotate_regions(regions = call_tf_gr,
+                                        annotations = piq_annotation_set,
+                                        ignore.strand = TRUE,
+                                        quiet = FALSE)
+      call_tf_annot_table <- data.frame(summarize_annotations(call_tf_annot))[,2]
+      count_feature <- rbind(count_feature,
+                             c(length_call_tf, call_tf_annot_table))
+      
+    }
+  }
+  
+  piq_annotation_raw[[i]] <- count_feature
+}
+```
+
+### Generate the TF landscape map
+
+```{r, fig.cap="The RAS OIS TF landscape in space and time"}
+##--> Load packages
+library(gtable)
+library(grid)
+library(data.table)
+library(scales)
+
+##--> Format the output 
+piq_annotation_raw_f <- do.call("rbind",  piq_annotation_raw)
+piq_annotation_raw_f <- piq_annotation_raw_f[-which(is.na(piq_annotation_raw_f)),]
+piq_annotation_raw_f$TF <- rep(names, 6)
+piq_annotation_raw_f$Day <- rep(c("D0", "D1", "D2", "D3", "D4", "D6"), each = length(names))
+colnames(piq_annotation_raw_f) <- c( "all", "enhancers","3UTRs",
+                                     "exons","intergenic", "introns",
+                                     "promoters", "TF", "Day")
+piq_annotation_raw_f <-piq_annotation_raw_f[,c(8,9,1,5,2,6,4,3,7)]
+
+##--> Remove redundant TFs
+tf_redundant <- c("MA0807.1_TBX5", "MA0806.1_TBX4", "MA0805.1_TBX1",
+                    "MA0849.1_FOXO6", "MA0848.1_FOXO4", "MA0847.1_FOXD2",
+                    "MA0042.2_FOXI1", "MA0033.2_FOXL1")
+piq_annotation_raw_f <- piq_annotation_raw_f[!piq_annotation_raw_f$TF %in% tf_redundant,]
+
+##--> Compute %
+piq_annotation_freq <- piq_annotation_raw_f
+piq_annotation_freq$TF <- gsub("MA.*\\..*_", "", piq_annotation_freq$TF)
+piq_annotation_freq[,c(4:9)] <- piq_annotation_freq[,c(4:9)] / apply(piq_annotation_freq[,c(4:9)], 1, sum) * 100
+
+##--> Scale total count
+sum <- c(unlist(by(piq_annotation_freq, piq_annotation_freq$Day, function(x) sum(x$all))))
+piq_annotation_freq$sum <- sum[match(piq_annotation_freq$Day, names(sum))]
+piq_annotation_freq$all <- round(piq_annotation_freq$all / piq_annotation_freq$sum * min(sum))
+
+##--> Remove TF with few binding sites (< 100)
+tf_remove <- unique(piq_annotation_freq[which(piq_annotation_freq$all < 300),1])
+piq_annotation_freq <- piq_annotation_freq[!piq_annotation_freq$TF %in% tf_remove,]
+
+##--> Reshape
+piq_annotation_freq_melt <- melt(piq_annotation_freq[,-10])
+colnames(piq_annotation_freq_melt) <- c("TF", "Day", "Features", "Count")
+tf_count <- piq_annotation_freq_melt[which(piq_annotation_freq_melt$Feature == "all"),]
+piq_annotation_freq_melt <- piq_annotation_freq_melt[-which(piq_annotation_freq_melt$Feature == "all"),]
+
+##--> Define the TF ordering
+tf_order <- piq_annotation_freq[which(piq_annotation_freq$Day == "D0"),]
+tf_order <- tf_order[order(rowSums(tf_order[,c(7:9)]),decreasing = FALSE),]
+piq_annotation_freq_melt$TF <- factor(piq_annotation_freq_melt$TF, levels = tf_order$TF)
+tf_count$TF <- factor(tf_count$TF, levels = tf_order$TF)
+
+##--> Define the Feature ordering
+piq_annotation_freq_melt$Features <- factor(piq_annotation_freq_melt$Features,
+                                            levels = rev(c("promoters", "3UTRs", "exons", 
+                                                           "introns", "enhancers", "intergenic")))
+
+##--> Generate side annotation with density in pionners / settlers / migrants
+tf_classif <- read.table("./data/PIQ/ORIGINAL/PIQ_TF_CLASSIFICATION.txt", header =T)
+tf_order_classif <- data.frame(TF = tf_order$TF)
+tf_order_classif$Classif <- "black"
+tf_order_classif$Classif[tf_order_classif$TF %in% tf_classif[which(tf_classif$Type == "Pioneers"),]$TF] <- "blue"
+tf_order_classif$Classif[tf_order_classif$TF %in% tf_classif[which(tf_classif$Type == "Settlers"),]$TF] <- "red"
+tf_order_classif$Classif[tf_order_classif$TF %in% tf_classif[which(tf_classif$Type == "Migrants"),]$TF] <- "green"
+tf_order_classif$Type <- factor(tf_order_classif$Classif, levels = c("blue", "red", "green"))
+tf_order_classif$Rank <- c(1:nrow(tf_order_classif))
+tf_order_classif$Day <- "All"
+
+##--> Density Plot
+A <- ggplot(tf_order_classif, aes(x = Rank, group = Type)) + 
+  geom_density(aes(group=Type, colour=Type, fill=Type), alpha = 0.6) +
+  scale_fill_manual(values = c("#4682B4", "#FF3030", "#A2CD5A")) +
+  scale_colour_manual(values = c("#4682B4", "#FF3030", "#A2CD5A")) +
+  coord_flip() +
+  facet_wrap(~Day) +
+  scale_x_continuous(expand = c(0.0,0.0)) +
+  scale_y_continuous(labels = scientific) +
+  theme(panel.background = element_rect(fill = NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(fill = NA, colour = "grey50"),
+        axis.text.x = element_text(angle = 90, hjust = 1),
+        axis.title.x =  element_blank(),
+        legend.position="none",
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+
+
+##--> Annotation plot
+B <- ggplot() + 
+  geom_bar(data = piq_annotation_freq_melt, aes(y = Count, x = TF, col = Features, fill = Features), stat = "identity", position = "stack") +
+  scale_color_manual(values = rev(c("brown3", "chocolate1", "whitesmoke", "gold", "darkolivegreen3", "steelblue"))) +
+  scale_fill_manual(values = rev(c("brown3", "chocolate1", "whitesmoke", "gold", "darkolivegreen3", "steelblue"))) +
+  facet_wrap(~Day, nrow = 1) +
+  coord_flip() +
+  theme(axis.text.y = element_text(colour=tf_order_classif$Classif)) +
+  theme(panel.background = element_rect(fill = NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(fill = NA, colour = "grey50"),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_text(angle = 90, hjust = 1),
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+
+##--> Plot showing the number of binding siter per TF per day
+C <- ggplot() + 
+  geom_point(data = tf_count, aes(y = Count, x = TF), color = "black", size = .5) +
+  facet_wrap(~Day, nrow = 1) +
+  theme(panel.background = element_rect(fill = NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(fill = NA, colour = "grey50"),
+        strip.background = element_blank(),
+        strip.text.x = element_blank()) +
+        coord_flip()
+
+##--> Overlapping plots B and C
+# To use facets with a dual y-axis ggplot, we used the tricks described at 
+# https://stackoverflow.com/questions/26917689/how-to-use-facets-with-a-dual-y-axis-ggplot/40746716
+
+p1 <- B
+p2 <- C
+g1 <- ggplotGrob(B)
+g2 <- ggplotGrob(C)
+
+# Get the locations of the plot panels in g1.
+pp <- c(subset(g1$layout, grepl("panel", g1$layout$name), se = t:r))
+
+# Overlap panels for second plot on those of the first plot
+g <- gtable_add_grob(g1, g2$grobs[grepl("panel", g1$layout$name)], 
+                     pp$t, pp$l, pp$b, pp$l)
+
+# ggplot contains many labels that are themselves complex grob; 
+# usually a text grob surrounded by margins.
+# When moving the grobs from, say, the left to the right of a plot,
+# Make sure the margins and the justifications are swapped around.
+# The function below does the swapping.
+# Taken from the cowplot package:
+# https://github.com/wilkelab/cowplot/blob/master/R/switch_axis.R 
+
+hinvert_title_grob <- function(grob){
+  
+  # Swap the widths
+  widths <- grob$widths
+  grob$widths[1] <- widths[3]
+  grob$widths[3] <- widths[1]
+  grob$vp[[1]]$layout$widths[1] <- widths[3]
+  grob$vp[[1]]$layout$widths[3] <- widths[1]
+  
+  # Fix the justification
+  grob$children[[1]]$hjust <- 1 - grob$children[[1]]$hjust 
+  grob$children[[1]]$vjust <- 1 - grob$children[[1]]$vjust 
+  grob$children[[1]]$x <- unit(1, "npc") - grob$children[[1]]$x
+  grob
+}
+
+# Get the y axis title from g2
+index <- which(g2$layout$name == "ylab-l") # Which grob contains the y axis title?   EDIT HERE
+ylab <- g2$grobs[[index]]                  # Extract that grob
+ylab <- hinvert_title_grob(ylab)           # Swap margins and fix justifications
+
+# Put the transformed label on the right side of g1
+g <- gtable_add_cols(g, g2$widths[g2$layout[index, ]$l], max(pp$r))
+g <- gtable_add_grob(g, ylab, max(pp$t), max(pp$r) + 1, max(pp$b), max(pp$r) + 1, clip = "off", name = "ylab-r")
+
+# Get the y axis from g2 (axis line, tick marks, and tick mark labels)
+index <- which(g2$layout$name == "axis-l-1-1")  # Which grob
+yaxis <- g2$grobs[[index]]                      # Extract the grob
+
+# yaxis is a complex of grobs containing the axis line, the tick marks, and the tick mark labels.
+# The relevant grobs are contained in axis$children:
+#   axis$children[[1]] contains the axis line;
+#   axis$children[[2]] contains the tick marks and tick mark labels.
+
+# First, move the axis line to the left
+# But not needed here
+# yaxis$children[[1]]$x <- unit.c(unit(0, "npc"), unit(0, "npc"))
+
+# Second, swap tick marks and tick mark labels
+ticks <- yaxis$children[[2]]
+ticks$widths <- rev(ticks$widths)
+ticks$grobs <- rev(ticks$grobs)
+
+# Third, move the tick marks
+# Tick mark lengths can change. 
+# A function to get the original tick mark length
+# Taken from the cowplot package:
+# https://github.com/wilkelab/cowplot/blob/master/R/switch_axis.R 
+plot_theme <- function(p) {
+  plyr::defaults(p$theme, theme_get())
+}
+
+tml <- plot_theme(p1)$axis.ticks.length   # Tick mark length
+ticks$grobs[[1]]$x <- ticks$grobs[[1]]$x - unit(1, "npc") + tml
+
+# Fourth, swap margins and fix justifications for the tick mark labels
+ticks$grobs[[2]] <- hinvert_title_grob(ticks$grobs[[2]])
+
+# Fifth, put ticks back into yaxis
+yaxis$children[[2]] <- ticks
+
+# Put the transformed yaxis on the right side of g1
+g <- gtable_add_cols(g, g2$widths[g2$layout[index, ]$l], max(pp$r))
+g <- gtable_add_grob(g, yaxis, max(pp$t), max(pp$r) + 1, max(pp$b), max(pp$r) + 1, 
+                     clip = "off", name = "axis-r")
+
+##--> Generate the plot
+grid.arrange(A, g,  layout_matrix = rbind(c(1,rep(2,9)),c(1,rep(2,9))))
+```
+
+# Session Info
+```{r, eval = TRUE, results = 'markup', message = TRUE, echo = TRUE,}
+sessionInfo()
+```

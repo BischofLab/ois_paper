@@ -1,0 +1,1372 @@
+---
+title: "Integrative multiomic profiling reveals epigenetic precoding, transcription factor hierarchies and reprogrammability of the senescent state"
+subtitle: "Appendix D : Exploration of the RAS OIS regulome"
+date: ""
+
+output:
+   BiocStyle::html_document:
+    theme: cosmo
+    highlight:  "tango"
+    toc: true
+    toc_float:
+      toc_collapsed: true
+    toc_depth: 2
+    number_sections: true
+    code_folding: 'show'
+    df_print: paged
+abstract: |
+---
+  
+  \pagebreak
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE, cache.lazy = FALSE, eval = TRUE, results = "hide", message = FALSE, warning = FALSE, echo = TRUE, fig.wide = TRUE,  fig.align='center', cache.comments = FALSE)
+```
+
+# Modular combinatorial binding
+
+To generate the modular combinatorial maps we have been through the following steps : 
+
+* combine PWMs according to their similarity using `r Biocpkg("TFBSTools")`,
+* combine PIQ binding instances accoriding to the PWMs clustering,
+* select PIQ binding instances inside enhancers,
+* define *cis*-regulatory lexicon with a Hierarchical Dirichlet Process unsing.
+
+## Cluster TFs according to PWMs similarity
+
+All transcription factor Position-Weight Matrices (PWM) representing eukaryote transcription factors were downloaded from the JASPAR database and used as an input for PIQ (as described in the preivous appendix) to predict transcription factor binding sites from the genome sequence on down-sampled ATAC-seq alignments. For each motif, we retained only binding sites that were within the reproducible ATAC-seq peaks and passed the default purity cut-off (70%). We then computed pairwise PWM similarities based on Pearson’s correlation, and clustered together PWMs sharing more than 90% similarity, defining a set of 310 non-redundant and distinct PWMs. The Pearson’s correlation between two PWM $P_1$ and $P_2$ of length $l$ was defined as:
+
+$$r(P^1,P^2)= \frac{1}{l} \sum_{i=1}^{l} \left( \frac{ \sum_{k \in \left( A,T,C,G \right) }  (P^1_{i,b} - 0.5)(P^2_{i,b} - 0.5) }{ \sum_{k \in \left( A,T,C,G \right) }  (P^1_{i,b} - 0.5)^2 * \sum_{k \in \left( A,T,C,G \right) } (P^2_{i,b} - 0.5)} \right)$$ 
+
+We further combined the bound instances identified with PIQ according to the PWM clustering.
+
+```{r, fig.cap= "Pair-wise Pearson's correlation heatmap for PWM in JASPAR", fig.height=10}
+##--> Load the libraries
+library(TFBSTools)
+library(pheatmap)
+library(colorRamps)
+
+
+##--> Import PWMs in TFBSTools format
+jaspar <- readJASPARMatrix(fn = "/Volumes/@home/bin/Tools/PIQ/pwms/jaspar_eukaryotes_519_TF.txt", type = "all")
+
+##--> Compute Euclidian distance and Pearson correlation between pairs of PWM
+simmat_euclidian <- matrix(nrow = 519, ncol = 519)
+simmat_pearson   <- matrix(nrow = 519, ncol = 519)
+
+for (i in c(1:519)) {
+  for (j in c(1:519)) {
+    print(paste(i, j))
+    simmat_euclidian[i,j] <- PWMSimilarity(toPWM(jaspar[[i]]), toPWM(jaspar[[j]]), method="Euclidean")
+    simmat_pearson[i,j] <- PWMSimilarity(toPWM(jaspar[[i]]), toPWM(jaspar[[j]]), method="Pearson")
+  }
+}
+
+##--> Rename columns and row
+colnames(simmat_euclidian) <- names(jaspar)
+row.names(simmat_euclidian) <- names(jaspar)
+colnames(simmat_pearson) <- names(jaspar)
+row.names(simmat_pearson) <- names(jaspar)
+
+##--> Heatmap Hierarchical clustring using Pearson's correlation matrix
+
+#  Cluster PWM with a similarity > .9
+simmat_pearson_2 <- simmat_pearson
+simmat_pearson_2[which(simmat_pearson > .9)] <- 1
+simmat_hclust <- hclust(d = as.dist(1-simmat_pearson),)
+clusters <- cutree(simmat_hclust, h = .1)
+
+# Build the heaptma
+pheatmap(simmat_pearson[simmat_hclust$order,simmat_hclust$order],
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         main = "Pair-wise PWM Pearson's similarity heatmap",
+         color = matlab.like(c(1000)))
+
+##--> Create a dictionnary to link PWM clusters with Jaspar PWM
+pwm_dictionnary <- data.frame(matrix(nrow =  length(unique(clusters)), ncol = 2))
+i <- 0
+for (a in 1:length(unique(clusters))) {
+  i <- i+1
+  tmp1 <- unique(clusters[clusters==a])
+  tmp2 <- paste(names(clusters[clusters==a]), collapse = " ")
+  pwm_dictionnary[i,1] <- tmp1
+  pwm_dictionnary[i,2] <- tmp2
+}
+
+```
+
+## Combine binding instances
+
+The following R chunk (not evaluated in the present document) was used to combine PIQ "bound" instances corresponding to a set of transcription factor belonging to the same PWM cluster, for every time point independently. It takes as an input the PWM dictionnary created in the previous section, and the path to the folder containing PIQ output.
+
+```{r, eval = FALSE}
+##--> Import the PWM dictionnaty
+pwm_dictionnary  <- read.table("./results/DICTIONNARY_TF_CLUSTERING_SIMILARITY_PWM.txt", sep = "\t", header = TRUE)
+
+##--> Combine binding information for clustered PWM
+n_file <- NULL
+
+for (day in c("D0","D1","D2","D3","D4","D6")) {
+  
+  # List PIQ files for a given time point
+  piq_files <- list.files("PIQ_OUT", pattern = paste("PIQ_CALL_", day, sep = ""), full = TRUE)
+  piq_name <-  list.files("PIQ_OUT", pattern = paste("PIQ_CALL_", day, sep = ""))
+  n_file <- rbind(n_file, paste(length(piq_files), length(piq_name)))
+  
+  # Parse each line of the dictionnary
+  for (i in 1:nrow(pwm_dictionnary)) {
+    
+    # Reformat the name to avoid possible conflict in output file name
+    target <- pwm_dictionnary[i,]
+    target[,2] <- gsub("::", ";;", target[,2])
+    target[,2] <- gsub("\\*", "$", target[,2])
+    print(target[,2])
+    
+    # List PWM names belonging to a given PWM cluster and reformat to match PIQ output name
+    tf <- scan(text = as.character(target[,3]), what = "")
+    tf <- unlist(lapply(tf, function(x) {gsub("\\.", "", x)}))
+    tf <- unlist(lapply(tf, function(x) {gsub("::", "", x)}))
+    tf <- unlist(lapply(tf, function(x) {gsub("(|)", "", x)}))
+    tf <- unlist(lapply(tf, function(x) {gsub("-", "", x)}))
+    
+    # Import corresponding .bed file (Watson and Crick strands for each PWM)
+    # and combine binding instances
+    bed_file <- piq_files[grep(paste(tf, collapse = "|"), piq_name)]
+    piq_call  <- adply(bed_file, 1, read.table)
+    piq_call <- unique(call[,c(2:4)])
+    
+    # Output
+    write.table(piq_call, paste("/PIQ_OUT", target[,1], "_",target[,2],"_", day, ".bed", sep = ""),
+                quote = F, col.names = F, row.names = F, sep ="\t")
+    
+  }
+}
+```
+
+## Select enhancer-binding instances 
+
+We finally selected bound instance located inside enhancers defined as the overlap between H3K4me1 and H3K27ac ChIP-seq reproducible peaks at any given time point using the following R code chunk (not evaluated in the present document).
+
+```{r, eval = FALSE}
+##--> Define coordinated of enhancers
+library(GenomicFeatures)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+library(EnsDb.Hsapiens.v75)
+
+# Get the coordinates for genes and exons for hg19
+genes_hg19 <- genes(TxDb.Hsapiens.UCSC.hg19.knownGene)
+exons_hg19 <- exons(TxDb.Hsapiens.UCSC.hg19.knownGene)
+tss_hg19 <- promoters(EnsDb.Hsapiens.v75,
+                      upstream=2000,
+                      downstream=200,
+                      columns = "gene_id")
+tss_hg19 <- renameSeqlevels(tss_hg19, paste("chr", seqlevels(tss_hg19), sep = ""))
+tss_hg19 <- unique(tss_hg19)
+genome(tss_hg19) <- "hg19"
+
+
+##--> Set path to ChIP-seq
+root_chip <- "./data/ChIP-seq/"
+
+##--> Define H3K4Me1 positive regions at any given time point
+chip_h3k4me1 <- list.files(path = root_chip,
+                    full.names = TRUE,
+                    pattern = "_H3K4me1_MACS2_OPTIMAL_IDR.bed")
+chip_h3k4me1  <- lapply(chip_h3k4me1 , read.table)
+chip_h3k4me1  <- GRangesList(lapply(chip_h3k4me1 , function(x) {GRanges(seqnames = x$V1,
+                                                        IRanges(x$V2, x$V3))}))
+chip_h3k4me1 <- lapply(chip_h3k4me1, reduce)
+
+##--> Define H3K27ac positive regions at any given time point
+chip_h3k27ac <- list.files(path = root_chip,
+                    full.names = TRUE,
+                    pattern = "_H3K27ac_MACS2_OPTIMAL_IDR.bed")
+chip_h3k27ac  <- lapply(chip_h3k27ac, read.table)
+chip_h3k27ac  <- GRangesList(lapply(chip_h3k27ac , function(x){GRanges(seqnames = x$V1,
+                                                       IRanges(x$V2, x$V3))}))
+chip_h3k27ac  <- lapply(chip_h3k27ac , reduce)
+
+##--> Define active enhancers at each time point
+enhancers <- GRangesList(intersect(chip_h3k4me1[[1]], chip_h3k27ac[[1]]),
+                         intersect(chip_h3k4me1[[2]], chip_h3k27ac[[2]]),
+                         intersect(chip_h3k4me1[[3]], chip_h3k27ac[[3]]))
+enhancers  <- reduce(unlist(enhancers ))
+
+##--> Exclude exons and TSS from the target regions
+enhancers <- reduce(setdiff(enhancers , exons_hg19, ignore.strand=TRUE))
+
+##--> List PIQ calls (after combining for PWM similaries)
+PIQ_CALL <- list.files("./data/PIQ/COMBINED/", 
+                       pattern = "PIQ_CALL_IDR_COMBINED_PWM_CLUSTER_",
+                       full = TRUE)
+
+##--> Filter PIQ instances
+for (i in PIQ_CALL) {
+  
+  name <- gsub("./data/PIQ/COMBINED/PIQ_CALL_IDR_COMBINED_PWM_CLUSTER_", "" ,i)
+  print(name)
+  
+  # Import calls and convert to GRanges
+  call <- read.table(i)
+  call_gr <- GRanges(call[,1], IRanges(call[,2], call[,3]))
+  
+  # Select instances onverlapping enhancers
+  call_enhancers <- subsetByOverlaps(call_gr, enhancers)
+  
+  # Output
+   if (length(Call_Enhancers) == 0) {
+    write.table(" ", paste("./data/PIQ/FILTERED/PIQ_CALL_IDR_COMBINED_PWM_CLUSTER_ENHANCERS_", Name, sep = ""))
+   }else{
+    export(Call_Enhancers, paste("./data/PIQ/FILTERED/PIQ_CALL_IDR_COMBINED_PWM_CLUSTER_ENHANCERS_", Name, sep = ""))
+  }
+}
+```
+
+## Define regulatory modules with GEM
+
+For every cluster of PWM and time-point independently, we first removed all the bound instances identified outside enhancers. The remaining bound instances for all PWM were then combined for every time point using GEM regulatory module discovery setting at 500 bp the minimal distance for merging nearby TF bound instances into co-binding regions and at 3 the minimum number of TF bound instances in a co-binding region. The following code chunk.
+
+**NB:** To build the GEM regulatory modules, all the data were processed using the following code chunks written in *bash* and ran on a Unix cluster driven by Sun Gride Engine.
+
+
+### Format inputs for GEM 
+
+```{bash, eval = FALSE}
+
+Day=(D0 D1 D2 D3 D4 D6)
+Feature=(ENHANCERS)
+
+for day in ${Day[@]}; do
+    echo $day
+    for i in $(ls --color=never ../Bilan_Call/ | grep $day | grep IDR | grep ENHANCERS | sed 's/.bed//g'); do
+        #echo -e "Position \t IP \t Control \t Fold \t Expectd \t Q_-lg10 \t P_-lg10 \t P_poiss \t IPvsEMP \t Noise"  > $i.txt
+        cat ../Bilan_Call/"$i".bed | 
+        sed 's/^chr//g' | 
+        awk '{OFS = "\t"; print $1":"$2, 454, 7, 58, 41, 120, 122, 295, -0.76, 0.03, "--------", 0, "*"}' >> $i.txt
+    done
+done
+
+for day in ${Day[@]}; do
+    for feature in ${Feature[@]}; do
+        for file in $(ls --color=never ./ | grep "$day".txt | grep $feature); do
+            name=$(echo $file | sed 's/PIQ_CALL_IDR_COMBINED_PWM_CLUSTER_ENHANCERS_//g' | sed 's/PIQ_CALL_IDR_COMBINED_PWM_CLUSTER_PROMOTERS_//g' | sed 's/_D[012346].txt//g')
+            echo -e "$name\t$file " >> GEM_"$feature"_"$day".txt
+        done
+    done
+done
+```
+
+
+### Run GEM 
+
+```{bash, eval = FALSE}
+for i in $(ls --color=never ./ | grep "^GEM_[ENHANCERS|PROMOTERS].*txt" | sed 's/.txt//g' ); do
+    qsub \
+    -q ono \
+    -cwd \
+    -V \
+    -b y java -Xmx15G -jar ~/bin/Tools/gem.jar RMD \
+          --g hg19.chrom.sizes \
+          --ex hg19_encode_blacklist.txt \
+          --mark_peak_file "$i".txt \
+          --distance 500 -\
+          -min_site 3 -\
+          -out "$i"_W500
+done
+```
+
+### Combine regulatory modules across time-points
+
+```{bash, eval = FALSE}
+for feature in ${Feature[@]}; do
+    cat 0_BS_clusters.GEM_"$feature"_D*.d500.min3.HDP.txt > HDP_"$feature"_W500.txt
+done
+```
+
+### Run HDP 
+
+```{bash, eval = FALSE}
+qsub \
+  -q ono \
+  -cwd -\
+  V \
+  -b y ~/bin/Tools/hdp/hdp/hdp \  
+        --algorithm train \
+        --data HDP_ENHANCERS_W500.txt \
+        --eta 0.1 \
+        --directory \
+        ./HDP_ENHANCERS_W500 \
+        --random_seed 0 \
+        --init_topics 50 \
+        --max_iter 2000
+```
+
+
+# Focus on pair-wise cobinding
+
+## Pair-wise co-binding global map
+
+At this step, we obtained a set of contingency matrices $M_{mt}$ of dimension ${n_{mt} * j}$ with $i$ the number of co-binding regions for the transcriptomic module $m$ at the time point $t$ and $j = 310$ PWM clusters, for each time point and each transcriptomic module. We then generated module- and time- specific normalized pairwise co-binding matrices $C_{mt}$ by computing the normalized cross-product of matrices $M_{mt}$ defined as:
+
+
+$$C_{mt} = \frac{M_{mt} * M_{mt}^\mathsf{T}}{\sum_{t}\sum_{m}\sum_{j}a_{tmj}} * 10^6$$
+
+with $a_{tmj} the number of bound instances for the PWM clusters $j$, in transcriptomic module $m$, at the time point $t$. To get a global picture of pairwise co-binding, we summed these matrices and tested for each combination of PWM clusters A and B whether the overlap between bound instances for A and B was significant using a hyper-geometric test defined as:
+
+$$ p(Q,M,n,k) = \sum_{m=k}^{min(k,B)} \frac{{M \choose m}{Q-M \choose n-m}}{{Q \choose m}}$$
+
+where $Q$ is the overall number of regions in the universe, $M$ is the number of regions bound by A, $n$ is the number of regions bound by B, and $k$ the total number of regions bound by A and B. The *p*-values were further corrected for multiple testing using the Bonferroni strategy. We finally clustered the co-binding occurrence matrix using Ward’s aggregation criterion and projected corresponding corrected *q*-values on this clustering.
+
+
+### Convert GEM output to pair-wise cobinding matrices
+
+```{r, message = FALSE, warning = FALSE, echo = TRUE, eval = FALSE}
+##-->  Combine GEM regions across time points 
+gem_files <- list.files("./data/GEM/",
+                  pattern = "_W500.d500.min3.factorCount_matrix.txt",
+                  full = TRUE)
+gem <- unlist(lapply(gem_files, function(x) {read.table(x, stringsAsFactors = FALSE)[,1]}))
+gem <- strsplit(gem, split = ":|-")
+gem <- data.frame(matrix(unlist(gem), ncol = 3, byrow = TRUE))
+colnames(gem) <- c("chr", "start", "end")
+gem <- GRanges(gem)
+gem <- reduce(gem)
+seqlevels(gem) <- paste("chr", seqlevels(gem), sep = "")
+
+##-->  Annotate regions
+# Load libraries
+library(ChIPpeakAnno)
+library(R.utils)
+library(rtracklayer)
+
+# Import and format annotation 
+annot <- read.table("./results/MICROARRAY_ANNOTATION_BIOCONDUCTOR.txt", sep = "\t",
+                    header = TRUE, stringsAsFactors = FALSE)
+annot <- annot[-which(is.na(annot$Chromosome) | is.na(annot$Start)| is.na(annot$Stop)),]
+annot <- GRanges(seqnames = paste("chr", annot$Chromosome, sep = ""),
+                      IRanges(start = annot$Start, end = annot$Stop),
+                      mcols = data.frame(probes = as.character(annot$Probe_ID),
+                                         gene = as.character(annot$HGNC_Symbol)))
+
+# Convert coordinates from hg38 to hg19
+chain <- import.chain("./tools/hg38ToHg19.over.chain")
+annot <- unlist(liftOver(annot, chain))
+
+# Link with transcriptomic data
+data_transcriptome <- read.table("./results/TIMECOURSE_RAS_Q_LIMMA_WGCNA.txt", header = TRUE, sep ="\t")
+annot$mcols.module <- merge(mcols(annot),
+                            data_transcriptome,
+                            by.x = "mcols.probes",
+                            by.y = "Row.names",
+                            all.x = TRUE)$Module
+
+# Annotate GEM output
+seqlevels(chain) <- seqlevels(gem)
+gem_annot <- annotatePeakInBatch(gem, AnnotationData = annot, output = "shortestDistance")
+mcols(gem_annot) <- mcols(annot[as.numeric(mcols(gem_annot)$feature)])
+gem_annot <- unique(gem_annot)
+
+##-->  Generate the cobinding matrices
+
+# List PIQ files (binding instances at enhancer only)
+piq_call <- list.files("./data/PIQ/FILTERED/", pattern = "PIQ_CALL_IDR_COMBINED_PWM_CLUSTER", full = TRUE)
+
+# Generate count matrices based on PIQ and GEM output 
+# for each time point and each transcriptomic cluster
+
+social_map <- list()
+i <- 0
+
+for (day in c("D0", "D1", "D2", "D3", "D4", "D6")) {
+    
+  print(day)
+  i <- i + 1
+  co_bind <- data.frame(matrix(nrow = length(gem_annot), ncol = nrow(pwm_dictionnary) + 3))
+  co_bind[,1] <- gem_annot$mcols.probes
+  co_bind[,2] <- gem_annot$mcols.gene
+  co_bind[,3] <- gem_annot$mcols.module
+  colnames(co_bind)[-c(1:3)] <- as.character(pwm_dictionnary[,2])
+  row.names(co_bind) <- paste(seqnames(gem_annot),
+                              start(gem_annot),
+                              end(gem_annot), sep = "_")
+  j <- 3
+  
+  for (tf in pwm_dictionnary$Cluster.number) {
+    print(tf)
+    j <- j +1
+      
+    print(pwm_dictionnary[which(pwm_dictionnary$Cluster.number == tf),2])
+    id <- paste("CLUSTER_ENHANCERS_", tf, "_", ".*", "_", day, sep = "")
+      
+    # Process the candidate binding sites
+    bed_file <- piq_call[grep(id, piq_call)]
+    call  <- read.table(bed_file)
+    call_gr <- GRanges(seqnames = call[,1],
+                        IRanges(start = call[,2], end = call[,3]))
+    
+    n_site <- countOverlaps(gem, call_gr)
+    co_bind[,j] <- n_site
+  }
+    social_map[[i]] <- co_bind
+}
+
+##--> Reformate the output
+modules <- unique(data_transcriptome$Module)[-1]
+social_map_by_module <- list()
+i<- 0
+
+for (module in modules) {
+  print(module)
+  i <- i + 1
+  j <- 0
+  tmp <- list()
+  for (day in c("D0", "D1", "D2", "D3", "D4", "D6")) {
+    j <- j + 1
+    tmp[[j]] <- social_map[[j]][which(social_map[[j]][,3] == module),]
+  
+  }
+  names(tmp) <- c("D0", "D1", "D2", "D3", "D4", "D6")
+  social_map_by_module[[i]] <- tmp
+}
+names(social_map_by_module) <- modules
+```
+
+### Pair-wise co-binding landscape
+
+```{r, message = FALSE, warning = FALSE, echo = TRUE, fig.cap= "Genome-wide transcription factor co-binding occurrences summed across time-point ", fig.height=10}
+##--> Load social maps
+load("./data/GEM/RAS_OIS_GEM_SOCIAL_MAPS_ENHANCERS_W500.RData")
+
+##--> Build normalize social maps
+# Create object to store outputs
+social_map_all <- lapply(social_map_by_module, function(x) {lapply(x, function(x) {x <- x[,-c(1:3)]})})
+all_heatmap <- list()
+all_heatmap_raw <- list()
+social_map_all_norm <- list()
+
+# Count the total number of binding site for each TF
+count_total_per_tf <- unlist(social_map_all, recursive = FALSE)
+count_total_per_tf <- do.call("rbind", count_total_per_tf)
+count_total_per_tf <- colSums(count_total_per_tf)
+
+# Define the normalization factor (total number of PIQ instances per time point)
+norm_factor <- c(1093089, 1230886, 1196470, 1180254,1126729, 1067289)
+
+# Create a normalized time-wise module-wise co-binding matrix
+for (clust in c(1:7)) {
+  tmp <- list()
+  for (i in c(1:6)) {
+    tmp[[i]] <- crossprod(as.matrix(social_map_all [[clust]][[i]])) / norm_factor[i] * 1000000
+  }
+   social_map_all_norm[[clust]] <- tmp
+}
+
+# Sum the co-binding across all modules
+global_view <- lapply(social_map_all, function(x) (Reduce('+', lapply(x, function(y) crossprod(as.matrix(y))))))
+global_view <- Reduce('+', global_view )
+global_view[is.na(global_view)] <- 0
+
+##--> Test for cobinding significancy with a hypergeometric test
+binom <- global_view
+for(m in 1:nrow(binom)){
+  for(n in 1:ncol(binom)){
+      if(n>m){
+        
+      binom[n,m] <- phyper(binom[m,n]-1,
+                           count_total_per_tf[m],
+                           sum(count_total_per_tf)-count_total_per_tf[m],
+                           count_total_per_tf[n],
+                           lower.tail=F, log.p = FALSE)
+      }
+    }
+ }
+
+# Build a symetric matrix to store p-values and correction for multiple testing
+global_view_signif <- binom
+global_view_signif_diag <- diag(global_view_signif)
+global_view_signif[upper.tri(global_view_signif, diag=TRUE)] = 0
+global_view_signif <- global_view_signif + t(global_view_signif) + diag(global_view_signif_diag)
+diag(global_view_signif) <- 1
+global_view_signif <- matrix(p.adjust(global_view_signif, method = "bonferroni"), ncol = ncol(binom))
+global_view_signif <- -log10(global_view_signif)
+global_view_signif[is.infinite(global_view_signif)] <- 300
+colnames(global_view_signif) <- colnames(binom)
+row.names(global_view_signif) <- colnames(binom)
+
+# Build a symetric matrix to store co-binding occurences
+global_view_signif_2  <- binom
+global_view_signif_2_diag <- diag(global_view_signif_2)
+global_view_signif_2[lower.tri(global_view_signif_2, diag=TRUE)] = 0
+global_view_signif_2 <- global_view_signif_2 + t(global_view_signif_2) + diag(global_view_signif_2_diag) 
+diag(global_view_signif_2) <- 0
+colnames(global_view_signif_2) <- colnames(global_view)
+row.names(global_view_signif_2) <- colnames(global_view)
+
+
+##--> Build the heatmap for co-binding occurences
+# Load libraries
+library(circlize)
+library(plotrix)
+
+# Define color scheme
+colors <- colorRamp2(seq(from = quantile(global_view_signif_2, probs = seq(0, 1, 0.05))[1],
+                         to =   quantile(global_view_signif_2, probs = seq(0, 1, 0.05))[20],
+                         length.out = 30),
+                    smoothColors("#356FB2",28,"#EBE517"))
+
+# Heatmap
+global_view_signif_hm <- pheatmap(log(global_view_signif_2 +1),
+                                  scale = "none",
+                                  color = smoothColors("#356FB2",28,"#EBE517"), 
+                                  main = "Genome-wide transcription factor co-binding occurrences summed across time-point",
+                                  show_rownames = FALSE,
+                                  show_colnames = FALSE,
+                                  legend = TRUE)
+
+# Save the order of clustering
+hm_order <- global_view_signif_hm$tree_row$order
+hm_order <- rownames(global_view_signif_2)[hm_order]
+
+global_view_signif_hm 
+```
+
+```{r, message = FALSE, warning = FALSE, echo = TRUE, fig.cap= "Test for co-binding enrichment", fig.height=10}
+##--> Build the heatmap for hypergeometric tests
+global_view_signif_hm_count <- pheatmap(global_view_signif[hm_order, hm_order],
+                                   scale = "none", cluster_rows = FALSE,
+                                   cluster_cols = FALSE,
+                                   color = smoothColors("#356FB2",28,"red"),
+                                   main = "Test for co-binding enrichment",
+                                   show_rownames = FALSE,
+                                   show_colnames = FALSE,
+                                   legend = TRUE)
+global_view_signif_hm_count
+```
+
+```{r, message = FALSE, warning = FALSE, echo = TRUE, fig.cap= "Density in pioneer, settler and migrant TFs along the two previous heatmaps"}
+##--> Build the density profiles for pioneers / settlers / migrants
+pwm_dictionnary  <- read.table("./results/DICTIONNARY_TF_CLUSTERING_SIMILARITY_PWM.txt", sep = "\t", header = TRUE)
+hm_order <- pwm_dictionnary[match(hm_order, pwm_dictionnary$Cluster.Name),]
+
+
+# Add density plot for TF type
+library(ggplot2)
+hm_order$Status <- factor(hm_order$Status, levels = c("Pioneers", "Settlers", "Migrants"))
+density_plot <- ggplot(hm_order, aes(x = c(1:310), group = Status)) + 
+                      geom_density(aes(group=Status, colour=Status, fill=Status), alpha = 0.6) +
+                      scale_fill_manual(values = c("#4682B4", "#FF3030", "#A2CD5A")) +
+                      scale_colour_manual(values = c("#4682B4", "#FF3030", "#A2CD5A")) +
+                      scale_y_continuous(limits = c(0,0.01)) +
+                      theme(panel.background = element_rect(fill = NA),
+                            panel.grid.major = element_blank(),
+                            panel.grid.minor = element_blank(),
+                            panel.border = element_rect(fill = NA, colour = "grey50"))
+
+density_plot
+```
+
+## Pair-wise co-binding dynamic circos plots
+
+To generate the co-binding circos plots, we used the global time- and, module-specific pair-wise normalized co-binding matrix $C_{mt} described above, after a logarithmic transformation. For each time-point and module independently, we selected the top 500 interactions based on their occurrence N. The images were generated using the Circos suite.
+
+### Build input for Circos
+
+```{r}
+n_link <- data.frame(matrix(nrow = 7, ncol = 6))
+
+for (clust in c(1:7)) {
+  
+  # Format the social maps
+  social_map_circos <- lapply(social_map_by_module, function(x) {lapply(x, function(x) {x <- x[,-c(1:3)]})})
+
+  for (day in c(0:5)) {
+    
+  # Get the crossproduct for the social map at day i, for cluster j
+  circos <- crossprod(as.matrix(social_map_circos [[clust]][[day+1]])) /  norm_factor[day+1] * 1000000
+  
+  # Remove interaction not significantly enriched genome-wide
+  # q-value < 10-5
+  circos[which(global_view_signif < 5)] <- 0
+
+  # Order rows and colums
+  colnames(circos)  <- pwm_dictionnary[order(pwm_dictionnary$Cluster.number),2]
+  row.names(circos) <- pwm_dictionnary[order(pwm_dictionnary$Cluster.number),2]
+
+  # Get the top 500 most occuring interactions at day i, for cluster j
+  threshold <- sort(c(circos), decreasing = TRUE)[500]
+  
+  # Format to get a diagonal matrix
+  circos <- circos[match(pwm_dictionnary$Cluster.Name, row.names(circos)), 
+                   match(pwm_dictionnary$Cluster.Name, colnames(circos))]
+  circos[upper.tri(circos, diag = FALSE)] <- (circos[lower.tri(circos, diag = FALSE)] +
+                                              circos[upper.tri(circos, diag = FALSE)]) / 2
+  circos[lower.tri(circos, diag = TRUE)] <- 0
+  circos[is.na(circos)] <- 0
+
+  # Log transform and remove empty rows and column
+  circos <- log(circos + 1)
+  circos[which(circos  < log(threshold))] <- 0
+  circos <- circos[-which(rowSums(circos) == 0 & colSums(circos) == 0),
+                   -which(rowSums(circos) == 0 & colSums(circos) == 0)]
+  
+  
+  length(which(circos > 0))
+  n_link[clust, day+1] <- length(which(circos > 0))
+
+  # Format colnames and row.names for compatibility with Circos
+  row.names(circos) <- gsub("::", "_", row.names(circos))
+  row.names(circos) <- gsub("\\(|\\)", "", row.names(circos))
+  row.names(circos) <- gsub("\\*", "", row.names(circos))
+  colnames(circos) <- gsub("\\*", "", colnames(circos))
+  colnames(circos) <- gsub("::", "_", colnames(circos))
+  colnames(circos) <- gsub("\\(|\\)", "", colnames(circos))
+
+  # Output
+  write.table(circos,
+  paste("./results/CIRCOS/Circos_ENHANCERS_ALL_C",
+        clust, "_D",
+        day, ".txt", sep=""),
+  quote = FALSE, 
+  col.names = TRUE, 
+  row.names = TRUE,
+  sep = "\t")
+  }
+}
+
+```
+
+### Draw Circos plots
+
+**NB:** To build the Circos plot, all the data were processed using the following code chunks written in *bash* and ran on a Unix cluster driven by Sun Gride Engine.
+
+```{bash, eval = FALSE}
+##--> Create output directories for every time point and gene module
+
+for i in $(ls --color=never ./ | grep Circos_ | sed "s/.txt//g")
+do
+mkdir ./$i/; mv ./$i".txt" ./$i/
+done
+
+
+
+##--> Generate Circus configuration file for every time point and gene module
+
+for i in $(ls --color=never ./ | grep "Circos_" | grep -v conf |sed 's/\///g' )
+do
+echo "
+<colors>
+<<include ./$i/colors.conf>>
+<<include ./$i/colors_percentile.conf>>
+</colors>
+
+<<include /pasteur/homes/piroux/bin/Tools/Circos/circos-0.69-4/tools/tableviewer/etc/ideogram.conf>>
+<<include /pasteur/homes/piroux/bin/Tools/Circos/circos-0.69-4/tools/tableviewer/etc/ticks.conf>>
+
+karyotype = ./karyotype_save.txt
+
+<image>
+<<include /pasteur/homes/piroux/bin/Tools/Circos/circos-0.69-4/etc/image.conf>>
+dir*  = ./
+file* = ./$i.png
+</image>
+
+chromosomes_units              = 10
+chromosomes_display_default    = yes
+chromosomes_order_by_karyotype = yes
+
+
+<links>
+
+<link>
+ribbon           = yes
+flat             = yes
+file             = ./$i/cells.txt
+bezier_radius    = 0.0r
+radius           = 0.999r-30p
+thickness        = 1
+color            = grey
+stroke_color     = dgrey
+stroke_thickness = 0
+
+
+</link>
+
+</links>
+
+<<include etc/colors_fonts_patterns.conf>>
+<<include ./housekeeping.conf>>" >> circos_$i.conf
+done
+
+##--> Draw Circos plots
+
+for i in $(ls --color=never ./ | grep circos_Circos)
+do
+echo "circos -conf ./$i" >> ./CIRCOS_PLOT.txt
+done
+
+qarray -q ono -cwd -V -b y CIRCOS_PLOT.txt
+
+```
+
+# Transcritpion factor lexicons
+
+We used the data-sets generated using GEM regulatory module discovery described above. Following the approach described in (Guo and Gifford, 2017), we applied a Hierarchical Dirichlet Process topic model which automatically determines the number of topics from the data, with the hyperparameter for the topic Dirichlet distribution set at 0.1 (encoding the assumption that most of the topics contains a few TFs) and the maximum number of iterations set at 2000.
+
+## Prepare annex data
+
+```{r}
+##-->  Load the biomeRt and the biovizBase packages
+library(biomaRt)
+library(biovizBase)
+library(GenomicRanges)
+
+##-->  Connexion to BioMart hg19 (aka GRCh37)
+ensembl <- useMart(biomart="ENSEMBL_MART_ENSEMBL",
+                   host="grch37.ensembl.org",
+                   path="/biomart/martservice",
+                   dataset="hsapiens_gene_ensembl")
+
+##-->  Retrive the coordinates of TSSs
+tss <- getBM(mart = ensembl,
+             attributes = c("chromosome_name", "transcript_start", "hgnc_symbol", "strand"))
+
+##-->  Format the chromosome name column (to match the chromosome names in alignement files)
+tss$chromosome_name <- paste("chr", tss$chromosome_name, sep = "")
+#TSS <- TSS[-which(is.na(TSS$transcription_start_site)),]
+
+##-->  Creating a GRange containing the information related to TSSs
+# And add a +/- 5kb window
+tss_gr <- GRanges(seqnames = tss$chromosome_name,
+                  ranges = IRanges(start = tss$transcript_start - 5000,
+                                   end = tss$transcript_start + 5000,
+                                   names = tss$hgnc_symbol),
+                  strand = tss$strand)
+
+##-->  Define PROMOTER and ENHANCER regions
+# Get gene and exon coordinates for hg19
+library(GenomicFeatures)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+library(EnsDb.Hsapiens.v75)
+
+genes_hg19 <- genes(TxDb.Hsapiens.UCSC.hg19.knownGene)
+exons_hg19 <- exons(TxDb.Hsapiens.UCSC.hg19.knownGene)
+tss_hg19 <- promoters(EnsDb.Hsapiens.v75, upstream=2000, downstream=200,  columns = "gene_id")
+tss_hg19 <- renameSeqlevels(tss_hg19, paste("chr", seqlevels(tss_hg19), sep = ""))
+tss_hg19 <- unique(tss_hg19)
+genome(tss_hg19) <- "hg19"
+
+##--> Set path to ChIP-seq
+root_chip <- "./data/ChIP-seq/"
+
+##--> Define H3K4Me1 positive regions at any given time point
+chip_h3k4me1 <- list.files(path = root_chip,
+                    full.names = TRUE,
+                    pattern = "_H3K4me1_MACS2_OPTIMAL_IDR.bed")
+chip_h3k4me1  <- lapply(chip_h3k4me1 , read.table)
+chip_h3k4me1  <- GRangesList(lapply(chip_h3k4me1 , function(x) {GRanges(seqnames = x$V1,
+                                                        IRanges(x$V2, x$V3))}))
+chip_h3k4me1 <- lapply(chip_h3k4me1, reduce)
+
+##--> Define H3K27ac positive regions at any given time point
+chip_h3k27ac <- list.files(path = root_chip,
+                    full.names = TRUE,
+                    pattern = "_H3K27ac_MACS2_OPTIMAL_IDR.bed")
+chip_h3k27ac  <- lapply(chip_h3k27ac, read.table)
+chip_h3k27ac  <- GRangesList(lapply(chip_h3k27ac , function(x){GRanges(seqnames = x$V1,
+                                                       IRanges(x$V2, x$V3))}))
+chip_h3k27ac  <- lapply(chip_h3k27ac , reduce)
+
+##--> Define active enhancers at each time point
+enhancers <- GRangesList(intersect(chip_h3k4me1[[1]], chip_h3k27ac[[1]]),
+                         intersect(chip_h3k4me1[[2]], chip_h3k27ac[[2]]),
+                         intersect(chip_h3k4me1[[3]], chip_h3k27ac[[3]]))
+enhancers  <- reduce(unlist(enhancers ))
+
+##--> Exclude exons and TSS from the target regions
+enhancers <- reduce(setdiff(enhancers , exons_hg19, ignore.strand=TRUE))
+promoters <- reduce(setdiff(tss_hg19, exons_hg19, ignore.strand=TRUE))
+
+seqlevels(tss_gr) <- gsub("chr", "", seqlevels(tss_gr))
+seqlevels(enhancers) <- gsub("chr", "", seqlevels(enhancers))
+```
+
+## Import and format HDP outputs
+
+```{r, fig.cap="Contribution of TFs to lexicons - Before simplification", fig.width=5}
+##--> Load libraries
+library(GenomicRanges)
+library(ComplexHeatmap)
+library(randomcoloR)
+library(zoo)
+library(colorRamps)
+
+##--> Import the HDP global data set (matrix d, w, z, t)
+hdp_word <- read.table("./data/HDP/mode-word-assignments.dat", header = TRUE)
+
+##--> Import the HDP state matrix
+hdp_state <-  read.table("./data/HDP/state.log", header = TRUE)
+
+##--> Import the window to TF matrix 
+hdp_window_to_tf <- read.table("./data/GEM/0_BS_clusters.D0_W500.Dictioinary.txt")
+
+##--> Global view of the HDP output
+
+# Generate a global contingency matrix TF x lexicon (all time points collapsed)
+hdp <- hdp_word[,c(2:3)]
+hdp$w <- as.factor(hdp$w)
+hdp$z <- as.factor(hdp$z)
+hdp_table <- table(hdp$w, hdp$z)
+names <- colnames(hdp_table)
+
+all_hdp <- matrix(hdp_table, nrow = nrow(hdp_table), ncol = ncol(hdp_table))
+colnames(all_hdp) <- names
+row.names(all_hdp) <- hdp_window_to_tf[,1]
+
+# Generate a scaled contingency matrix TF x lexicon
+all_hdp_scaled <- t(scale(t((all_hdp))))
+row.names(all_hdp_scaled ) <- gsub("COMBINED_PWM_CLUSTER_", "", row.names(all_hdp_scaled ))
+
+# Cluster the scaled contingency matrix TF x lexicon
+clust_col <- hclust(as.dist(1-cor(all_hdp_scaled )), method = "average")
+clust_row <- hclust(as.dist(1-cor(t(all_hdp_scaled ))), method = "average")
+
+# Compute the total AP1 binding per lexicon
+index_AP1 <- c(196, 37, 14,26, 271, 24, 25)
+anno_col_1 <- HeatmapAnnotation(barplot = anno_barplot(log10((colSums(all_hdp[index_AP1,])+1) /(colSums(all_hdp)) * 100)[clust_col$order], axis = TRUE), which = "column")
+
+# Compute the total occurence for each lexicon
+anno_col_2 <- HeatmapAnnotation(barplot = anno_barplot(colSums(all_hdp)[clust_col$order]))
+
+# Compute the total occurence for each TF
+anno_row <- rowAnnotation(barplot = anno_barplot(rowSums(all_hdp[clust_row$order, clust_col$order]), which = "row", axis_direction = c("reverse")))
+
+# Build the complex heatmap 
+heatmap_hdp_all <- anno_row  + Heatmap(all_hdp_scaled[clust_row$order,clust_col$order],
+                             gap = unit(0, "mm"),
+                             show_heatmap_legend = FALSE,
+                             bottom_annotation = anno_col_1,
+                             top_annotation = anno_col_2,
+                             cluster_rows = FALSE,
+                             cluster_columns = FALSE,
+                             col = blue2green2red(100),
+                             show_row_names = TRUE, row_names_gp = gpar(fontsize = 3),
+                             show_column_names  = TRUE, column_names_gp = gpar(fontsize = 3))
+
+
+heatmap_hdp_all
+
+```
+
+## Process and filter the data
+
+```{r, fig.cap="Contribution of TFs to lexicons - After simplification", fig.width=5}
+##--> Cluster and simplify the lexicons
+# Cluster
+clust <- cutree(hclust(as.dist(1-cor(all_hdp_scaled[clust_row$order, clust_col$order])), method = "average"),h = .5)
+all_hdp_simplified <- data.frame(matrix(nrow=nrow(all_hdp), ncol=length(unique(clust))))
+row.names(all_hdp_simplified) <- row.names(all_hdp)
+colnames(all_hdp_simplified) <- sort(unique(clust))
+
+# Simplify the global dataset
+hdp_simplified <- hdp_word
+hdp_simplified$z <- clust[paste(hdp_simplified$z)]
+
+all_hdp_simplified <- hdp_simplified
+all_hdp_simplified$w <- as.factor(all_hdp_simplified$w)
+all_hdp_simplified$z <- as.factor(all_hdp_simplified$z)
+all_hdp_simplified <- table(all_hdp_simplified$w,all_hdp_simplified$z)
+names <- colnames(all_hdp_simplified)
+
+all_hdp_simplified <- matrix(all_hdp_simplified, nrow = nrow(all_hdp_simplified), ncol = ncol(all_hdp_simplified))
+colnames(all_hdp_simplified) <- names
+row.names(all_hdp_simplified) <- hdp_window_to_tf[,1]
+
+# Generate a simplified scaled contingency matrix TF x lexicon
+all_hdp_simplified_scaled <- t(scale(t((all_hdp_simplified))))
+row.names(all_hdp_simplified_scaled) <- gsub("COMBINED_PWM_CLUSTER_", "", row.names(all_hdp_simplified_scaled))
+
+# Generate a heatmap
+clust_col <- hclust(as.dist(1-cor(all_hdp_simplified_scaled )), method = "average")
+clust_row <- hclust(as.dist(1-cor(t(all_hdp_simplified_scaled ))), method = "average")
+
+# Compute the total AP1 binding per lexicon
+index_AP1 <- c(196, 37, 14,26, 271, 24, 25)
+anno_col_1 <- HeatmapAnnotation(barplot = anno_barplot(log10((colSums(all_hdp_simplified[index_AP1,])+1) / (colSums(all_hdp_simplified)) * 100)[clust_col$order], axis = TRUE), which = "column")
+anno_col_2 <- HeatmapAnnotation(barplot = anno_barplot((colSums(all_hdp_simplified))[clust_col$order]))
+anno_row <- rowAnnotation(barplot = anno_barplot(rowSums(all_hdp_simplified[clust_row$order,clust_col$order]), which = "row", axis_direction = c("reverse")))
+
+heatmap_hdp_simplified  <- anno_row + Heatmap(all_hdp_simplified_scaled[clust_row$order,clust_col$order],
+                               gap = unit(0, "mm"),
+                               show_heatmap_legend = FALSE,
+                               bottom_annotation = anno_col_1,
+                               top_annotation = anno_col_2,
+                               cluster_rows = FALSE,
+                               cluster_columns = FALSE,
+                               col = blue2green2red(100),
+                               show_row_names = TRUE, row_names_gp = gpar(fontsize = 8),
+                               show_column_names  = TRUE, column_names_gp = gpar(fontsize = 8))
+
+heatmap_hdp_simplified 
+
+```
+
+## Interactive lexicon heatmap
+
+```{r, results = "show", fig.cap="Interactive lexicon heatmap",fig.width=5}
+##--> Load library heatmaply
+library(heatmaply)
+
+##--> Format the data
+heatmap_interactive <- data.frame(all_hdp_simplified_scaled[clust_row$order,clust_col$order])
+colnames(heatmap_interactive) <- gsub("X", "",colnames(heatmap_interactive))
+rownames(heatmap_interactive) <- gsub("\\.\\.", ":",rownames(heatmap_interactive))
+rownames(heatmap_interactive) <- gsub("\\..\\.", "(",rownames(heatmap_interactive))
+
+##--> Add cell annotations with leading TF for each lexicon
+heatmap_interactive_annot <- heatmap_interactive
+heatmap_interactive_annot  <- apply(heatmap_interactive_annot, 2, function(x) {row.names(heatmap_interactive_annot)[x > 1]})
+heatmap_interactive_annot <- lapply(heatmap_interactive_annot, function(x) {paste(x, collapse = "\n")})
+
+temp_annot <- as.data.frame(matrix(0, ncol = ncol(heatmap_interactive), nrow = nrow(heatmap_interactive)))
+
+for (i in c(1 : nrow(heatmap_interactive))) {
+  temp_annot[i,] <- unlist(heatmap_interactive_annot)
+}
+
+heatmap_interactive_annot <- list("Leading TFs" = temp_annot)
+
+##--> Plot the interactive heatmap
+heatmaply(all_hdp_simplified_scaled[clust_row$order,clust_col$order],
+          Rowv = F, Colv = F, custom_hovertext = heatmap_interactive_annot[[1]],
+          fontsize_row = 5, label_names = c("Regulons","TFs", "Z-score"),
+          subplot_margin = c(0,0,0,0))
+
+```
+
+## Enhancer centric and time-resolved analysis
+
+```{r}
+##--> List the GEM ouptut for each time point
+n_window_per_day <- list.files("./data/GEM/",
+                                pattern = "0_BS_clusters.D[012346]_W500.d500.min3.HDP.txt",
+                               full = TRUE)
+
+##--> Get the total number of regulatory region per day
+n_window_per_day  <- lapply(n_window_per_day, function(x) length(readLines(x)))
+
+##--> Define the index used to scan the global matrix
+index_window_per_day <- unlist(n_window_per_day)
+interval <- c(0,cumsum(index_window_per_day) - 1)
+interval <- rbind(interval[c(1,2)], interval[c(2,3)], interval[c(3,4)],
+                  interval[c(4,5)], interval[c(5,6)], interval[c(6,7)])
+interval[-1,1] <- interval[-1,1] + 1
+
+
+##--> Create objects to store outputs
+hdp_2 <- list()
+hdp_3 <- list()
+count <- list()
+annot <- list()
+heatmaps <- list()
+window_gr <- list()
+window_gr_all <- list()
+
+##--> Parse the global matrix to generate time point specifc matrices
+day <- c("D0", "D1", "D2", "D3", "D4", "D6")
+
+colors <- distinctColorPalette(length(unique(hdp_simplified$z)))
+colors <- col2rgb(colors)
+colors <- apply(colors, 2, function(x) {paste(x[1], x[2], x[3], sep =",")})
+
+# Loop over time point
+for (i in c(1:6)) {
+  
+  a <- interval[i,1]
+  b <- interval[i,2]
+  
+  # Import the GEM file corresponding to time point i
+  window <- read.table(paste("./data/GEM/",
+                              "0_BS_clusters.",
+                             day[i],"_W500.d500.min3.factorCount_matrix.txt",
+                             sep = ""), stringsAsFactors = FALSE)[,1]
+  
+  # Format regions as GRanges
+  window <- data.frame(matrix(unlist(strsplit(window, split = ":|-")),
+                              ncol = 3, byrow = TRUE))
+  colnames(window) <- c("chr", "start", "end")
+  window <- GRanges(window)
+  window$ID <- c(a:b)
+
+  # Subset the global matrix to get regions corresponding to the time point i
+  hdp_2[[i]] <- hdp_simplified[which(hdp_simplified$d >= a & hdp_simplified$d <= b),]
+  hdp_2[[i]]$w <- as.factor(hdp_2[[i]]$w)
+  hdp_2[[i]]$z <- as.factor(hdp_2[[i]]$z)
+  levels(hdp_2[[i]]$z) <- levels(as.factor(hdp_simplified$z))
+  
+  # Match the window ID with the window coordinates
+  window <- window[match(unique(hdp_2[[i]][,c(1,3)])$d, window$ID, nomatch = 0),]
+  window$Topic <- unique(hdp_2[[i]][,c(1,3)])$z
+  window$Color <- colors[as.numeric(as.character(window$Topic))+1]
+  
+  # Save the total set of regions
+  window_gr_all[[i]] <- window
+  
+  # Select regions overlapping enhancers
+  window <- subsetByOverlaps(window, enhancers)
+  
+  # Remove regions overlapping TSS
+  window <- window[countOverlaps(window, tss_gr + 1000) <= 1L]
+  
+  # Output lexicons coordinates (.bed format)
+  window_out <- data.frame(window_gr_all[[i]])
+  window_out <- window_out[,c(1,2,3,7,4,5,2,3,8)]
+  write.table(window_out , paste("./results/LEXICONS/Lexicon", day[i],".bed",sep =""),
+              col.names = FALSE, row.names = FALSE, quote=F,sep = "\t")
+  
+  # Format
+  window_gr[[i]] <- window
+  window <- data.frame(window)
+  window <- data.frame(window[,1], window[,2], window[,3],
+                       paste(window[,1], window[,2], window[,3], sep = "_"),
+                       window[,7], "*", window[,2], window[,3], window[,8], window[,7])
+  
+  # Generate the enhancer-centric and time-resolved heatmap
+  
+  hdp_2[[i]] <- hdp_2[[i]][which(is.element(hdp_2[[i]]$d, window_gr[[i]]$ID)),]
+  count[[i]] <- table(hdp_2[[i]]$z)
+  count[[i]] <- count[[i]]
+  count[[i]] <- count[[i]][clust_col$order]
+  annot[[i]]  <- HeatmapAnnotation(barplot = anno_barplot(c(count[[i]], axis = TRUE)))
+  
+  hdp_2[[i]] <- table(hdp_2[[i]]$w, hdp_2[[i]]$z)
+  names <- colnames(hdp_2[[i]])
+  hdp_2[[i]] <- matrix(hdp_2[[i]], nrow = nrow(hdp_2[[i]]), ncol = ncol(hdp_2[[i]]))
+  colnames(hdp_2[[i]]) <- names
+  row.names(hdp_2[[i]]) <- hdp_window_to_tf[,1]
+  
+  hdp_2[[i]] <- hdp_2[[i]][clust_row$order,clust_col$order]
+  hdp_3[[i]] <- hdp_2[[i]]
+  hdp_3[[i]] <- hdp_3[[i]]/sum(hdp_3[[i]])*100000
+  row.names(hdp_3[[i]]) <- gsub("COMBINED_PWM_CLUSTER_", "", row.names(hdp_3[[i]]))
+  
+  heatmaps[[i]] <- Heatmap(t(scale(t(hdp_3[[i]]))),
+                       gap = unit(0, "mm"),
+                       show_heatmap_legend = FALSE,
+                       bottom_annotation = annot[[i]],
+                       cluster_rows = FALSE,
+                       cluster_columns = FALSE,
+                       show_row_names = FALSE,
+                       col = blue2green2red(100),
+                       show_column_names = TRUE)
+  if (i == 6) {
+    heatmaps[[i]] <- Heatmap(t(scale(t(hdp_3[[i]]))),
+                         gap = unit(0, "mm"),
+                         show_heatmap_legend = TRUE,
+                         bottom_annotation = annot[[i]],
+                         cluster_rows = FALSE,
+                         cluster_columns = FALSE,
+                         col = blue2green2red(100),
+                         show_row_names = TRUE, row_names_gp = gpar(fontsize = 6),
+                         show_column_names  = FALSE)
+  }
+}
+
+```
+
+## Overlap with chromatin data
+
+### Chromatin states
+
+```{r}
+##--> Load libraries
+library(data.table)
+library(ChIPpeakAnno)
+library(pheatmap)
+
+##--> List chromatin state files
+states <- list.files("./results/STATES/BROWSERFILES/", pattern = "States_RAS_.*.bed$", full.names = TRUE)
+annot_states <- lapply(states, read.table)
+names(annot_states) <- gsub("./results/STATES/BROWSERFILES/|.bed", "", states)
+
+
+##--> Perform overlap for the three time points study for chromatin states
+# Setup
+
+enrich_matrix_states_all <- list()
+day <- c(1,3,6)
+lexicon_to_states <- NULL
+
+# Loop over time points
+
+for (i in c(1:3)) {
+  
+  print(i)
+  
+  # Import corresponding state annotation
+  annot_states_tmp <- annot_states[[i]]
+  
+  # Format to GRanges
+  annot_states_tmp <- GRanges(seqnames = annot_states_tmp$V1,
+                            IRanges(start = annot_states_tmp$V2, end = annot_states_tmp$V3),
+                            mcols = data.frame(State = paste(i, annot_states_tmp$V4, sep = "_")))
+  
+  # Annotate lexicons for day i with states for day i when overlapping
+  lexicon_to_states_tmp <- annotatePeakInBatch(window_gr_all[[day[i]]],
+                                               AnnotationData = annot_states_tmp,
+                                               output = "overlapping",
+                                               multiple = TRUE)
+  mcols(lexicon_to_states_tmp) <- cbind(mcols(lexicon_to_states_tmp),
+                                        mcols(annot_states_tmp[as.numeric(mcols(lexicon_to_states_tmp)$feature)]))
+  
+  # Concatenate all time points
+  lexicon_to_states <- c(lexicon_to_states, lexicon_to_states_tmp)
+  
+}
+
+
+```
+
+### Histone modification ChIP-seq and ATAC-seq
+
+```{r}
+##--> List peaks .bed files
+marks <- list.files("./data/ChIP-seq/", pattern = ".*_HISTONE.*_MACS2_OPTIMAL_IDR.bed", full.names = TRUE)
+atac <-  list.files("./data/ATAC-seq/", pattern = ".*_MACS2_OPTIMAL_IDR.bed", full.names = TRUE)
+peaks <- c(marks, atac)
+annot_peaks <- lapply(peaks, read.table)
+names(annot_peaks) <- gsub("\\./data/ChIP-seq//RAS_OIS_CHIPSEQ_HISTONE_", "", peaks)
+names(annot_peaks) <- gsub("\\./data/ATAC-seq//RASOIS_", "",names(annot_peaks))     
+names(annot_peaks) <- gsub("_MACS2_OPTIMAL_IDR\\.bed", "",names(annot_peaks))     
+
+day_1 <- c("T0","72H","144H")
+day_2 <- c(1,3,6)
+lexicon_to_peaks <- NULL
+
+for (i in c(1:3)) {
+  
+  print(i)
+  
+  # Import corresponding state annotation
+  annot_peaks_tmp <- annot_peaks[grep(day_1[i], names(annot_peaks))]
+  annot_peaks_tmp <- rbindlist(lapply(1:length(annot_peaks_tmp),
+                               function(x){setDT(annot_peaks_tmp[[x]])[, id:=names(annot_peaks_tmp)[x]]}),
+                               use.names=TRUE, fill=TRUE)
+  
+  # Format to GRanges
+  annot_peaks_tmp <- GRanges(seqnames = annot_peaks_tmp$V1,
+                      IRanges(start = annot_peaks_tmp$V2, end = annot_peaks_tmp$V3),
+                      mcols = data.frame(ChIP = annot_peaks_tmp$id ))
+
+  # Annotate lexicons for day i with states for day i when overlapping
+  lexicon_to_peaks_tmp  <- annotatePeakInBatch(window_gr_all[[day_2[i]]],
+                                               AnnotationData = annot_peaks_tmp ,
+                                               output = "overlapping",
+                                               multiple = TRUE)
+  lexicon_to_peaks_tmp  <- lexicon_to_peaks_tmp [-which(is.na(mcols(lexicon_to_peaks_tmp )$feature))]
+  mcols(lexicon_to_peaks_tmp ) <- cbind(mcols(lexicon_to_peaks_tmp ), mcols(annot_peaks_tmp[as.numeric(mcols(lexicon_to_peaks_tmp)$feature)]))
+
+  lexicon_to_peaks <- c(lexicon_to_peaks, lexicon_to_peaks_tmp)
+}
+
+```
+
+### Combine with states and ChIP-seq / ATAC-seq
+
+```{r, fig.cap="Associations between TF lexicons and chromatin features", fig.width=5}
+
+##--> Process chromatin states data
+data_states <- lapply(lexicon_to_states, function(x) {table(x$Topic, x$mcols.State)})
+data_states <- lapply(data_states , function(x) {((x)/rowSums((x)))})
+data_states  <- do.call(cbind, data_states)
+
+##--> Process peak data
+data_peaks <- lapply(lexicon_to_peaks, function(x) {table(x$Topic, x$mcols.ChIP)})
+data_peaks <- lapply(data_peaks, function(x) {((x)/rowSums((x)))})
+data_peaks <- do.call(cbind, data_peaks)
+
+##--> Combine and cluster
+combine_states_and_peaks <- data.frame(cbind(data_peaks, data_states))
+combine_states_and_peaks <- scale(combine_states_and_peaks)
+
+hclust_2_row <- hclust(as.dist(1-cor(t(combine_states_and_peaks))), method="ward.D2")
+
+order_col <- c(grep("KmMe1", colnames(combine_states_and_peaks)),
+             grep("Active_Enh", colnames(combine_states_and_peaks)),
+             grep("Poised_Enh", colnames(combine_states_and_peaks)),
+             grep("ATAC", colnames(combine_states_and_peaks)),
+             grep("Bivalent_Enh", colnames(combine_states_and_peaks)), 
+             grep("Unmarked", colnames(combine_states_and_peaks)),
+             grep("Bivalent_Chromatin", colnames(combine_states_and_peaks)),
+             grep("Polycomb", colnames(combine_states_and_peaks)),
+             grep("K27me3", colnames(combine_states_and_peaks)),
+             grep("Bivalent_TSS", colnames(combine_states_and_peaks)),
+             grep("K27Ac", colnames(combine_states_and_peaks)),
+             grep("K4me3", colnames(combine_states_and_peaks)),
+             grep("Active_TSS", colnames(combine_states_and_peaks)))
+
+##--> Draw heatmap
+pheatmap(combine_states_and_peaks[hclust_2_row$order, order_col],
+         col = blue2green2red(100),
+         scale = "none",
+         treeheight_row = 0,
+         treeheight_col = 0,
+         fontsize = 9,
+         legend = FALSE,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE)
+
+```
+
+
+# Link with trancriptome
+
+## Multiple factor analysis
+
+```{r}
+##--> Annotate each window
+# Load libraries
+library(ChIPpeakAnno)
+library(rtracklayer)
+library(mixOmics)
+library(reshape2)
+library(FactoMineR)
+library(factoextra)
+library(ggrepel)
+
+# Import and format microarray annotation
+annot <- read.table("./tools/MICROARRAY_ANNOTATION_BIOCONDUCTOR.txt", header = TRUE, sep = "\t")
+annot <- annot[-which(is.na(annot$Chromosome) | is.na(annot$Start)| is.na(annot$Stop)),]
+annot <- GRanges(seqnames = paste("chr", annot$Chromosome, sep = ""),
+                      IRanges(start = annot$Start, end = annot$Stop),
+                      mcols = data.frame(probes = as.character(annot$Probe_ID),
+                                         gene = as.character(annot$HGNC_Symbol)))
+annot$mcols.probes <- gsub("hg.1", "hg", annot$mcols.probes)
+
+# Liftover (hg38 -> hg19)
+chain <- import.chain("./tools/hg38ToHg19.over.chain")
+seqlevels(chain) <- seqlevels(annot)                                        
+annot  <- unlist(liftOver(annot, chain))
+
+# Annotation of the HDP outputs
+window_HPD_annot <- lapply(window_gr,
+                          function(x){annotatePeakInBatch(x,
+                                                          AnnotationData = annot,
+                                                          output = "both",
+                                                          select = "all",
+                                                          multiple = TRUE,
+                                                          FeatureLocForDistance = "TSS",
+                                                          maxgap = 100000)})
+
+##--> Load the transcriptomic data
+data_transcriptome <- read.table("./results/TIMECOURSE_RAS_Q_LIMMA_WGCNA.txt", header = TRUE, sep ="\t")
+
+##--> Build a regulatory table for each time point 
+# Build a matrix "module x lexicons" fore each time point 
+table_reg <- list()
+
+for (i in c(1:6)) {
+  
+  print(i)
+  mcols(window_HPD_annot[[i]]) <- cbind(mcols(annot[as.numeric(mcols(window_HPD_annot[[i]])$feature)]),
+                                        mcols(window_HPD_annot[[i]]))
+  window_HPD_annot[[i]] <- unique(window_HPD_annot[[i]])
+  window_HPD_annot[[i]] <- merge(window_HPD_annot[[i]],data_transcriptome,
+                                 by.x = "mcols.probes", by.y = "Row.names")
+  table_reg[[i]] <- table(window_HPD_annot[[i]]$Module,
+                          window_HPD_annot[[i]]$Topic)
+  
+}
+
+##--> Format
+# Format row.names
+for (i in c(1:6)) {
+  colnames(table_reg[[i]]) <- paste(i, colnames(table_reg[[i]]), sep = "_")
+}
+
+##--> Compute frequencies per lexicon per module per time point
+table_reg_2 <- lapply(table_reg, function(x) x/sum(x))
+names(table_reg_2) <- c("T0", "24h", "28h", "72h", "96h", "144h")
+
+##--> Concatenate matrices
+data_mfa <- do.call(cbind, table_reg_2)
+
+##--> Run the multiple factor analysis
+# with 6 "modules x lexicons" frequency tables (one per time point)
+mfa <- MFA(data_mfa,
+           group = rep(54, 6),
+           name.group = c("T0", "24h", "28h", "72h", "96h", "144h"),
+           type = rep("f", 6),
+           graph = FALSE,
+           ncp = 3)
+
+
+```
+
+## Explore output of the MFA
+
+```{r, fig.cap="Screeplot", fig.width=5}
+##--> Explore outputs
+# Screeplot (% of variance per dimension)
+fviz_screeplot(mfa )
+```
+
+```{r, fig.cap="Partial axis graph", fig.width=5}
+# Partial axes
+fviz_mfa_axes(mfa,
+              palette = rev(c("#EC3423", "#4FBFF9", "#002EFF", "#5C26F5", "#E800FF", "#FF008B")))
+```
+
+```{r, fig.cap="Partial individual graph - Comp 1 vs Comp2", fig.width=5}
+# Partial individuals
+fviz_mfa_ind(mfa,
+             axes = c(1, 2),
+             partial = "all",
+             col.partial = "group",
+             palette = rev(c("#EC3423", "#4FBFF9", "#002EFF", "#5C26F5", "#E800FF", "#FF008B")))
+```
+
+```{r, fig.cap="Partial individual graph - Comp 1 vs Comp3", fig.width=5}
+fviz_mfa_ind(mfa,
+             axes = c(1, 3),
+             partial = "all",
+             col.partial = "group",
+             palette = rev(c("#EC3423", "#4FBFF9", "#002EFF", "#5C26F5", "#E800FF", "#FF008B")))
+```
+
+## Top-contributing lexicons
+
+```{r}
+##--> Select the top contributing lexicons
+select <- row.names(mfa$freq$contrib[which(rowMax(mfa$freq$contrib[,c(1:3)]) >= 1.2 &
+                                           rowMax(mfa$freq$cos2[,c(1:3)]) >= .4),])
+
+data_select <- data.frame(mfa$freq$coord[select ,c(1:3)])
+data_select$group <- as.factor(gsub("_.*", "", row.names(data_select)))
+levels(data_select$group) <- c("T0", "24h", "28h", "72h", "96h", "144h")
+```
+
+```{r, fig.cap="Variable graph - Comp 1 vs Comp 2", fig.width=5}
+##--> Variable plots
+ggplot(data_select, aes(x= Dim.1, y=  Dim.2, color = group)) +
+  geom_point() +
+  geom_text_repel(aes(label = row.names(data_select))) + 
+  scale_color_manual(values = c("#EC3423", "#4FBFF9", "#002EFF", "#5C26F5", "#E800FF", "#FF008B")) +
+  theme_bw()
+```
+
+```{r, fig.cap="Variable graph - Comp 1 vs Comp 3", fig.width=5}
+ggplot(data_select, aes(x= Dim.1, y=  Dim.3, color = group)) +
+  geom_point() +
+  geom_text_repel(aes(label = row.names(data_select))) + 
+  scale_color_manual(values = c("#EC3423", "#4FBFF9", "#002EFF", "#5C26F5", "#E800FF", "#FF008B")) +
+  theme_bw()
+
+```
+
+# Session Info
+```{r, eval = TRUE, results = 'markup', message = TRUE, echo = TRUE,}
+sessionInfo()
+```

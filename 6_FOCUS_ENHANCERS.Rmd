@@ -1,0 +1,798 @@
+---
+title: "Integrative multiomic profiling reveals epigenetic precoding, transcription factor hierarchies and reprogrammability of the senescent state"
+subtitle: "Appendix F : Focus on enhancers"
+date: ""
+
+output:
+   BiocStyle::html_document:
+    theme: cosmo
+    highlight:  "tango"
+    toc: true
+    toc_float:
+      toc_collapsed: true
+    toc_depth: 2
+    number_sections: true
+    code_folding: 'show'
+    df_print: paged
+abstract: |
+
+---
+  
+\pagebreak
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE, cache.lazy = FALSE, eval = TRUE, results = "hide", message = FALSE, warning = FALSE, echo = TRUE, fig.wide = TRUE,  fig.align='center', cache.comments = FALSE)
+```
+
+# Checking chromstaR accuracy
+
+Before going further into the exploration of the RAS OIS enhancer landscape, we first evaluated the accuracy of the chromatin state assignments provided by `r Biocpkg("chromstaR")`.
+
+Based on `r Biocpkg("chromstaR")` prediction, we first selected the following genomic regions :
+
+* Constitutive enhancers : genomic windows flagged as "active enhancers" at the 3 time points,
+* *De novo* enhancers : genomic windows flagged as "unmarked" at T0 and switching to "active enhancers" at 144h,
+* Remnant enhancers : genomic windows flagged as "active enhancers" at T0 and switching to "unmarked" at 144h,
+* Poised enhancers : genomic windows flagged as "poised enhancers" at T0, and switching to "active enhancers" at 72h and 144h,
+* Unmarked : genomic windows flagged as "unmarked" at T0, 72h and 144h.
+
+For each of these classes of genomic regions, we then computed the disctibution of the fold change in both H3K4me1 and H3K27ac ChIP-seq over the input. 
+
+
+## Prepare the data
+
+```{r, cache=FALSE}
+#--> Load library
+library(chromstaR)
+library(rtracklayer)
+
+#--> Load chromstaR results
+output_folder <- "./results/STATES/"
+model_cond <- get(load(file.path(output_folder, 'combined',
+                            'combined_mode-differential_refined.RData')))
+
+#--> Load emission matrix
+load("./results/STATES/emission_matrix.RData")
+
+#--> Formart segment (adding mnemonics)
+segments_cond <- model_cond$segments
+segments_cond$state.D0 <- emission_matrix[match(segments_cond$combination.D0,
+                                                             row.names(emission_matrix)),]$Feature
+segments_cond$state.D3 <- emission_matrix[match(segments_cond$combination.D3,
+                                                             row.names(emission_matrix)),]$Feature
+segments_cond$state.D6 <- emission_matrix[match(segments_cond$combination.D6,
+                                                             row.names(emission_matrix)),]$Feature
+
+#--> Define the differential fragments base on chromatin states
+diff_segment <- segments_cond 
+diff_segment <- segments_cond[(segments_cond$combination.D0 != segments_cond$combination.D3) |
+                              (segments_cond$combination.D0 != segments_cond$combination.D6) |
+                              (segments_cond$combination.D3 != segments_cond$combination.D6)]
+
+diff_segment_refined <- segments_cond 
+diff_segment_refined <- diff_segment_refined[diff_segment_refined$differential.score >= 1]
+
+diff_segment_refined <- diff_segment_refined[
+                              (diff_segment_refined$state.D0 != diff_segment_refined$state.D3) |
+                              (diff_segment_refined$state.D0 != diff_segment_refined$state.D6) |
+                              (diff_segment_refined$state.D3 != diff_segment_refined$state.D6)]
+
+#--> Refine the differential fragments focusing on IDR ChIP-seq and ATAC-seq peaks
+goldstandard_diff <- c(import("./data/ChIP-seq/GOLDSTANDARD_ALL_DAY_ALL_MARK_IDR.bed"),
+                       import("./data/ATAC-seq/GOLDSTANDARD_ATACSEQ_ALL_DAY_IDR.bed"))
+
+
+diff_segment_refined <- subsetByOverlaps(diff_segment_refined, goldstandard_diff)
+diff_segment_selec <- diff_segment_refined
+diff_segment_selec$combination <- paste("D0_", diff_segment_selec$state.D0, "_",
+                                        "D3_", diff_segment_selec$state.D3, "_",
+                                        "D6_", diff_segment_selec$state.D6, sep = "")
+```
+
+
+## Define target regions 
+
+```{r}
+library(rtracklayer)
+set.seed(1234)
+
+#--> Define "constitutive enhancers"
+constitutive_enh_w <- granges(segments_cond[which(segments_cond$state.D0 == "Active_Enh" &
+                                                segments_cond$state.D3 == "Active_Enh" &
+                                                segments_cond$state.D6 == "Active_Enh")])
+constitutive_enh_w$Change <- "constitutive"
+
+#--> Define "de novo enhancers"
+denovo_enh_w <- granges(diff_segment_selec[which(diff_segment_selec$combination == "D0_Unmarked_D3_Unmarked_D6_Active_Enh" |
+                                               diff_segment_selec$combination == "D0_Unmarked_D3_Active_Enh_D6_Active_Enh" |
+                                               diff_segment_selec$combination == "D0_Unmarked_D3_Poised_Enh_D6_Active_Enh")])
+denovo_enh_w$Change <-"denovo"
+
+
+#--> Define "remnant enhancers"
+remnant_enh_w <- granges(diff_segment_selec[which(diff_segment_selec$combination == "D0_Active_Enh_D3_Unmarked_D6_Unmarked" |
+                                                  diff_segment_selec$combination == "D0_Active_Enh_D3_Active_Enh_D6_Unmarked" |
+                                                  diff_segment_selec$combination == "D0_Active_D3_Poised_Enh_D6_Unmarked" | 
+                                                  diff_segment_selec$combination == "D0_Poised_D3_Unmarked_Enh_D6_Unmarked")])
+remnant_enh_w$Change <- "remnant"
+
+#--> Define "unmarked regions"
+unmarked_w <- granges(segments_cond[which(segments_cond$state.D0 == "Unmarked" &
+                                        segments_cond$state.D3 == "Unmarked" &
+                                        segments_cond$state.D6 == "Unmarked")])
+unmarked_w$Change <- "unmarked"
+
+#--> Define "poised enhancers getting activated"
+poised_enh_w <- granges(diff_segment_selec[which(diff_segment_selec$combination == "D0_Poised_Enh_D3_Active_Enh_D6_Active_Enh")])
+poised_enh_w$Change <- "poised"
+
+#--> Combine
+
+target_select_check <- c(constitutive_enh_w[sample(1:length(constitutive_enh_w), 10000, replace=FALSE)],
+                         unmarked_w[sample(1:length(unmarked_w), 10000, replace=FALSE)],
+                         denovo_enh_w,
+                         remnant_enh_w,
+                         poised_enh_w)
+seqlevels(target_select_check) <- seqlevelsInUse(target_select_check)
+
+```
+
+
+## Compute coverages
+
+```{r}
+library(EDASeq)
+library(biovizBase)
+
+##--> List input averages and normalized BigWig files
+bw <- list.files("./data/ChIP-seq/", pattern = "H3K27ac.*bw|H3K4me1.*bw|INPUT.*bw", full.names = TRUE)
+bw <- bw[c(8,5,2,7,4,1,9,6,3)]
+
+#--> Count signal in bins
+counts <- matrix(NA, nrow = length(target_select_check), ncol = length(bw))
+names <- gsub("./data/ChIP-seq//RAS_OIS_CHIPSEQ_HISTONE_|.bw", "", bw)
+
+for(i in c( 1: length(bw))) {
+  print(names[i])
+  
+  coverage <- rtracklayer::import(bw[i], as = 'RleList', which = target_select_check)
+  
+  for(chr in seqlevels(target_select_check)) {
+    
+    counts[which(seqnames(target_select_check) == chr) , i] <-
+      mean(Views(coverage[[chr]], ranges(target_select_check[seqnames(target_select_check) == chr])))
+    
+  }
+}
+
+#--> Select ChIP-seq counts
+counts_2 <- data.frame(counts[,-c(7:9)])
+colnames(counts_2) <- names[-c(7:9)]
+counts_2$Change <- target_select_check$Change
+counts_2$Width <- width(target_select_check)
+counts_2[,-c(7,8)] <- counts_2[,-c(7,8)] / counts_2[,8] * 1000
+
+#--> Select Input counts
+count_input <- counts[,c(7:9)]
+count_input <- count_input  / counts_2[,8] * 1000
+
+#--> Quantile normalization for inputs
+#count_input <- data.frame(betweenLaneNormalization(as.matrix(count_input)))
+#counts_2[,-c(7,8)] <- data.frame(betweenLaneNormalization(as.matrix(counts_2[,-c(7,8)])))
+
+#--> Compute ChIP / Input ratios
+counts_2[,-c(7,8)] <- data.frame((as.matrix(counts_2[,-c(7,8)])))
+counts_2[,c(1,4)] <- (counts_2[,c(1,4)]+1) / (count_input[,1]+1)
+counts_2[,c(2,5)] <- (counts_2[,c(2,5)]+1) / (count_input[,2]+1)
+counts_2[,c(3,6)] <- (counts_2[,c(3,6)]+1) / (count_input[,3]+1)
+counts_2 <- counts_2[,-8]
+
+#--> Reshape and format
+library(reshape)
+counts_2 <- melt(counts_2)
+counts_2$HM <- gsub(".*_", "", counts_2$variable)
+counts_2$Time <- gsub("_.*", "", counts_2$variable)
+counts_2$Time <- factor(counts_2$Time, levels = c("T0", "72H", "144H"))
+
+```
+
+## Violin plots
+
+```{r, fig.cap= "Distribution of fold-change in normalized H3K27ac and H3K4me1 ChIP-seq signals over input in the “unmarked”-, “constitutive”-, “poised”-, “de novo”-, and “remnant” enhancer windows",fig.height=8.5}
+#--> Build violin plots
+colors  <- c("#FF0000", "#00B9FF", "#1430B3", "#5B03F7", "#E800FF", "#FF008B")
+ggplot(counts_2, aes(x = Time, y = log2(value), fill = Time, group = Time)) +
+  geom_violin(trim=FALSE) + geom_boxplot(outlier.shape = NA, width=0.3, fill="white",  coef = 0) +
+  scale_fill_manual(values = colors[c(1,4,6)]) +
+  facet_grid(HM~Change, scales = "free") +
+  theme_classic()
+```
+
+# Metaprofiles 
+
+## Link windows to genomic features
+
+```{r}
+#--> Import goldstandard pic sets (intersection of all ChIP-seq and ATAC peaks)
+peaks <- goldstandard_diff
+atacseq_gold <- import("./data/ATAC-seq/GOLDSTANDARD_ATACSEQ_ALL_DAY_IDR.bed")
+
+#--> Define the differential fragments base on chromatin states
+segment_cond <- model_cond$segments
+
+#--> Formart differential segment (adding mnemonics)
+segment_cond$state.D0 <- emission_matrix[match(segment_cond$combination.D0,
+                                               row.names(emission_matrix)),]$Feature
+segment_cond$state.D3 <- emission_matrix[match(segment_cond$combination.D3,
+                                               row.names(emission_matrix)),]$Feature
+segment_cond$state.D6 <- emission_matrix[match(segment_cond$combination.D6,
+                                               row.names(emission_matrix)),]$Feature
+
+#--> Link "constitutive enhancer" windows to genomic features
+constitutive_enh <- segment_cond[which(segment_cond$state.D0 == "Active_Enh" &
+                                       segment_cond$state.D3 == "Active_Enh" &
+                                       segment_cond$state.D6 == "Active_Enh")]
+constitutive_enh <- subsetByOverlaps(peaks , constitutive_enh)
+constitutive_enh$Change <- "constitutive"
+
+#--> Link "de novo enhancers" windows to genomic features
+denovo_enh <- diff_segment_selec[which(diff_segment_selec$combination == "D0_Unmarked_D3_Unmarked_D6_Active_Enh" |
+                                       diff_segment_selec$combination == "D0_Unmarked_D3_Active_Enh_D6_Active_Enh" |
+                                       diff_segment_selec$combination == "D0_Unmarked_D3_Poised_Enh_D6_Active_Enh")] 
+denovo_enh <- subsetByOverlaps(peaks, denovo_enh)
+
+# Split "de novo enhancers" in "virgin" and "premarked"
+piq_T0 <- read.table("./data/PIQ/CLUSTER/PIQ_CALL_ALL_TF_COMBINED_PWM_CLUSTER_NOIDR_D0.bed")
+piq_T0 <- piq_T0 [,c(1:4)]
+colnames(piq_T0) <- c("chr", "start", "end", "TF")
+piq_T0_no_idr <- GRanges(piq_T0)
+piq_T0 <- subsetByOverlaps(piq_T0_no_idr, atacseq_gold)
+piq_T0 <- countOverlaps(denovo_enh, unique(piq_T0))
+
+denovo_enh_zero <- denovo_enh[which(countOverlaps(denovo_enh, piq_T0_no_idr) == 0)]
+denovo_enh_zero$Change <-"denovo_zero"
+denovo_enh_zero_resized <- resize(denovo_enh_zero , 10000, fix = "center")
+denovo_enh_zero_resized$Change <-"denovo_zero"
+
+denovo_enh_notzero <- denovo_enh[which(countOverlaps(denovo_enh, piq_T0_no_idr) > 0)]
+denovo_enh_notzero$Change <-"denovo_notzero"
+denovo_enh_notzero_resized <- resize(denovo_enh_notzero , 10000, fix = "center")
+denovo_enh_notzero_resized$Change <-"denovo_notzero"
+
+
+#--> Link "remnant enhancers" windows to genomic features
+remnant_enh <- diff_segment_selec[which(diff_segment_selec$combination == "D0_Active_Enh_D3_Unmarked_D6_Unmarked" |
+                                          diff_segment_selec$combination == "D0_Active_Enh_D3_Active_Enh_D6_Unmarked" |
+                                          diff_segment_selec$combination == "D0_Active_D3_Poised_Enh_D6_Unmarked" | 
+                                          diff_segment_selec$combination == "D0_Poised_D3_Unmarked_Enh_D6_Unmarked")] 
+
+remnant_enh <- subsetByOverlaps(peaks, remnant_enh)
+remnant_enh$Change <- "remnant"
+remnant_enh_resized <- resize(remnant_enh, 10000, fix = "center")
+remnant_enh_resized$Change <- "remnant"
+
+#--> Link "poised enhancers" windows to genomic features
+poised_enh <- subsetByOverlaps(peaks, poised_enh_w)
+poised_enh$Change <- "poised"
+poised_enh_resized <- resize(poised_enh, 10000, fix = "center")
+poised_enh_resized$Change <- "remnant"
+
+
+#--> Select "unmarked regions"
+set.seed(1234)
+unmarked <- segments_cond[which(segments_cond$state.D0 == "Unmarked" &
+                                  segments_cond$state.D3 == "Unmarked" &
+                                  segments_cond$state.D6 == "Unmarked")]
+
+#--> Refine and resize "constitutive enhancers"
+constitutive_enh_refined <- constitutive_enh[-which(overlapsAny(constitutive_enh,
+                                                                c(denovo_enh_notzero,
+                                                                  denovo_enh_zero,
+                                                                  remnant_enh)))]
+constitutive_enh_refined$Change <-"constitutive_enh"
+constitutive_enh_resized <- resize(constitutive_enh_refined, 10000,
+                                   fix = "center")[sample(1:length(constitutive_enh_refined),
+                                                          10000, replace=FALSE)]
+constitutive_enh_resized$Change <-"constitutive_enh"
+```
+
+## TF binding at de novo and remnant enhancers
+
+### TF binding histogram at de novo enhancers
+
+```{r, fig.cap="Distibution of total number of TFs bound per enhancer for constitutitve enhancers (grey), TF pre-marked de novo enhancers (yellow) and TF virgin de novo enhancers (orange)", fig.height=6}
+#--> Compute the TF binding at de novo enhancers
+hist_premarked_denovo <- data.frame(table(countOverlaps(denovo_enh, piq_T0_no_idr)) /
+                                      sum(table(countOverlaps(denovo_enh, piq_T0_no_idr))) * 100)
+hist_premarked_denovo$type <- "denovo"
+
+#--> Compute the TF binding at constitutive enhancers
+hist_premarked_constitutive <- data.frame(table(countOverlaps(constitutive_enh_refined , piq_T0_no_idr)) /
+                                            sum(table(countOverlaps(constitutive_enh_refined , piq_T0_no_idr))) * 100)
+hist_premarked_constitutive$type <- "constitutive"
+
+#--> Reshape
+hist_premarked <- rbind(hist_premarked_denovo,
+                        hist_premarked_constitutive)
+hist_premarked$type <- factor(hist_premarked$type ,
+                              levels = c("denovo","constitutive"))
+
+#--> Build histogram
+ggplot(hist_premarked) + 
+  geom_bar(aes(x = as.numeric(as.character(Var1)), y = Freq, fill = type),
+               stat = "identity", position = "identity",width = 1, alpha = .6) +
+  scale_fill_manual(values =c("#F5A623", "#4A4A4A")) +
+  scale_x_continuous(limits = c(0,100)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        legend.position="none")
+```
+
+
+### TF binding occurences at de novo (T0) and remnant (144h) enhancers
+
+```{r, fig.cap="TF binding occurences at de novo enhancers (T0)", fig.height=6}
+library(ggrepel)
+
+#--> Load TFs classification
+tf_classif <- read.table("./results/DICTIONNARY_TF_CLUSTERING_SIMILARITY_PWM.txt", sep ="\t", header = TRUE)
+
+#--> De novo enhancers
+# Count the number of binding occurences for each TF at de novo enhancers 
+piq_denovo <- subsetByOverlaps(piq_T0_no_idr, denovo_enh)
+hist_tf_denovo <- sort(table(piq_denovo $TF))
+
+# Format
+hist_tf_denovo <- data.frame(hist_tf_denovo,
+                             tf_classif$Status[charmatch(gsub("_.*$", "",names(hist_tf_denovo)),
+                                                         tf_classif$Cluster.number)])
+colnames(hist_tf_denovo) <- c("TF", "Freq", "Status")
+
+# Rank plot
+ggplot(hist_tf_denovo) +
+  geom_point(aes(x = TF, y = Freq, colour = Status),
+           stat = "identity", position = "identity",size = .5) +
+  scale_colour_manual(values =c("#98C650","#3D77AB","#FF292A")) +
+  geom_text_repel(data = tail(hist_tf_denovo, n=10), aes(x = TF, y = Freq, label = TF),
+                  segment.color = "black", size = 3,  force = 1, nudge_x = -0.25)  +
+  theme_classic() +
+  theme(axis.text.x = element_blank(),
+        legend.position="none")
+```
+
+```{r, fig.cap="TF binding occurences at remnant enhancers (144h)", fig.height=6}
+#--> Remnant enhancers
+# Import PIQ prediction at 144h
+piq_144h <- read.table("./data/PIQ/CLUSTER/PIQ_CALL_ALL_TF_COMBINED_PWM_CLUSTER_NOIDR_D6.bed")
+piq_144h <- piq_144h[,c(1:4)]
+colnames(piq_144h) <- c("chr", "start", "end", "TF")
+piq_144h_no_idr <- GRanges(piq_144h)
+piq_144h <- subsetByOverlaps(piq_144h_no_idr, atacseq_gold)
+piq_144h <- countOverlaps(denovo_enh, unique(piq_144h))
+
+# Count the number of binding occurences for each TF at de novo enhancers 
+piq_remnant <- subsetByOverlaps(piq_144h_no_idr, remnant_enh)
+hist_tf_remnant <- sort(table(piq_remnant $TF))
+
+# Format
+hist_tf_remnant <- data.frame(hist_tf_remnant,
+                             tf_classif$Status[charmatch(gsub("_.*$", "", names(hist_tf_remnant)),
+                                                         tf_classif$Cluster.number)])
+colnames(hist_tf_remnant) <- c("TF", "Freq", "Status")
+
+# Rank plot
+ggplot(hist_tf_remnant) +
+  geom_point(aes(x = TF, y = Freq, colour = Status),
+             stat = "identity", position = "identity",size = .5) +
+  scale_colour_manual(values =c("#98C650","#3D77AB","#FF292A")) +
+  geom_text_repel(data = tail(hist_tf_remnant, n=10), aes(x = TF, y = Freq, label = TF),
+                  segment.color = "black", size = 3,  force = 1, nudge_x = -0.25)  +
+  theme_classic() +
+  theme(axis.text.x = element_blank(),
+        legend.position="none")
+```
+
+## Metaprofiles for the different classes of enhancers
+
+```{r, fig.cap="Metaprofiles (histone ChIP-seq, GC content, conservation) for various class of enhancers", fig.height=8}
+#--> Select data 
+target_select_metaprofiles <- c(constitutive_enh_resized,
+                                denovo_enh_notzero_resized,
+                                denovo_enh_zero_resized,
+                                remnant_enh_resized)
+seqlevels(target_select_metaprofiles) <- seqlevelsInUse(target_select_metaprofiles)
+target_select_metaprofiles$Change <- factor(target_select_metaprofiles$Change,
+                                            levels = c("constitutive_enh", "denovo_notzero",
+                                                       "denovo_zero", "remnant"))
+
+#--> Generate tiles
+target_select_metaprofiles_split <- tile(target_select_metaprofiles, n = 1000) # Give a GRangesList
+target_select_metaprofiles_split <- unlist(flatGrl(target_select_metaprofiles_split))   # Transform GRangesList to GRanges
+
+
+#--> List input averages and normalized BigWig files
+bw <- c("./tools/hg19.phastCons46way.placental.bw",
+        "./tools/hg19.phastCons46way.primtates.bw",
+        "./tools/hg19.gc5Base.bw",
+        "./data/ChIP-seq/RAS_OIS_CHIPSEQ_HISTONE_T0_H3K4me3.bw",
+        "./data/ChIP-seq/RAS_OIS_CHIPSEQ_HISTONE_T0_H3K4me1.bw",
+        "./data/ChIP-seq/RAS_OIS_CHIPSEQ_HISTONE_T0_H3K27ac.bw",
+        "./data/ChIP-seq/RAS_OIS_CHIPSEQ_HISTONE_T0_H3K27me3.bw",
+        "./data/ATAC-seq/RASOIS_ATACSEQ_T0_REP123_NUCLEO_OCC.bw")
+names <- c("PC46PLA","PC46PRIM","GC","K4Me3","K4Me1","K27Ac","K27Me3", "Nuc")
+
+#--> Count signal in bins
+counts <- matrix(NA, nrow = length(target_select_metaprofiles_split), ncol = length(bw))
+
+for(i in c( 1: length(bw))) {
+  print(names[i])
+  
+  coverage <- import(bw[i], as = 'RleList', which = target_select_metaprofiles)
+  
+  for(chr in seqlevels(target_select_metaprofiles_split)) {
+    
+    counts[which(seqnames(target_select_metaprofiles_split) == chr) , i] <-
+      mean(Views(coverage[[chr]], ranges(target_select_metaprofiles_split[seqnames(target_select_metaprofiles_split) == chr])))
+    
+  }
+}
+
+#--> Transform into matrix and compute mean signal
+count_list <- list()
+for (i in c(1:length(bw))) {
+  print(i)
+  tmp_1 <- t(matrix(counts[,i], nrow = 1000))
+  tmp_list <- list()
+  
+  for (j in levels(as.factor(target_select_metaprofiles$Change))) {
+   tmp_2 <- tmp_1[which(target_select_metaprofiles$Change == j),]
+   thresh_1 <- max(quantile(tmp_2, 0.90), 1L)
+   tmp_2 <- pmin(tmp_2, thresh_1 )
+   tmp_list[[j]] <- colMeans(tmp_2, na.rm = TRUE)
+  }
+count_list[[i]] <- tmp_list
+}
+
+#--> Reshape
+names(count_list) <- names
+count_list_r <- melt(count_list)
+count_list_r$pos <- rep(1:1000)
+colnames(count_list_r) <- c("value", "type", "data", "pos")
+
+#--> Build metaprofiles
+ggplot(count_list_r, aes(x = pos, y = value)) +
+  geom_smooth(data = count_list_r, method = "loess", span=.2,
+              aes(color = type, group = type), se = FALSE,
+              size = .5) +
+  facet_wrap(~data, scales = "free")
+
+
+```
+
+# Integration with expression
+
+## Relationship with global expression pattern and FC
+
+```{r, fig.cap="Relative expression profiles for genes associated with the different class of enhancers", fig.height=6}
+library(ChIPpeakAnno)
+
+#--> Define the target regions
+target_select_expression <- c(constitutive_enh_refined,
+                              denovo_enh_notzero,
+                              denovo_enh_zero,
+                              remnant_enh,
+                              poised_enh)
+
+#--> Format
+seqlevels(target_select_expression) <- seqlevelsInUse(target_select_expression)
+target_select_expression$Change <- factor(target_select_expression$Change, levels = c("constitutive_enh",
+                                                                                      "denovo_notzero",
+                                                                                      "denovo_zero",
+                                                                                      "remnant",
+                                                                                      "poised"))
+
+#--> Import transcriptomic data without filtering
+#annot_state <-  read.table("./tools/MICROARRAY_ANNOTATION_BIOCONDUCTOR.txt", header = TRUE, sep ="\t")
+annot_state <- read.table("~/Desktop/Test_Annot.txt", header = TRUE, sep ="\t")
+
+#--> Annotate transitions (assigning closest genes) 
+
+annot_state <- annot_state[-which(is.na(annot_state$Chromosome) | is.na(annot_state$Start)),]
+annot_state <- GRanges(seqnames = paste("chr", annot_state$Chromosome, sep = ""),
+                      IRanges(start = annot_state$Start, end = annot_state$Start),
+                      mcols = data.frame(probes = as.character(annot_state$Probe_ID),
+                                         gene = as.character(annot_state$HGNC_Symbol)))
+                                         
+state_change_annot <- annotatePeakInBatch(target_select_expression,
+                                          AnnotationData = annot_state,
+                                          output = "nearestLocation")
+mcols(state_change_annot) <- data.frame(mcols(state_change_annot),  
+                                        mcols(annot_state[as.numeric(mcols(state_change_annot)$feature)]))
+state_change_annot$mcols.probes <- gsub("hg.1$", "hg", state_change_annot$mcols.probes)
+
+
+#--> Import transcriptomic data 
+data_transcriptome <- read.table("./results/TIMECOURSE_RAS_Q_LIMMA_WGCNA.txt", header = TRUE, sep ="\t")
+row.names(data_transcriptome) <- gsub("hg.1$", "hg", row.names(data_transcriptome))
+average_transcriptomic_data  <- data_transcriptome
+
+##--> Z-score
+zscore_transcriptomic_data <- data.frame(Row.names = average_transcriptomic_data$Row.names,
+                                        t(scale(t(average_transcriptomic_data[,c(2:7)]),
+                                                center = TRUE, scale = TRUE)),
+                                        average_transcriptomic_data[,-c(1:7)])
+
+##--> Format Z-score
+zscore_transcriptomic_data  <- merge(zscore_transcriptomic_data,
+                                     mcols(state_change_annot),
+                                     by.x = "Row.names", by.y = "mcols.probes")
+zscore_transcriptomic_data  <- zscore_transcriptomic_data [-which(zscore_transcriptomic_data$Change.x == "STABLE"),]
+
+zscore_transcriptomic_data <- zscore_transcriptomic_data[,c("RAS_1_0", "RAS_1_24", "RAS_1_48",
+                                                      "RAS_1_72", "RAS_1_96","RAS_1_144",
+                                                      "Row.names", "Change.y", "Max_LFC_RAS")]
+colnames(zscore_transcriptomic_data ) <- c("D0", "D1", "D2", "D3", "D4", "D6", "Probes", "Change", "Max_LFC_RAS")
+
+zscore_transcriptomic_data <- melt(data.frame(zscore_transcriptomic_data), 
+                                   id.vars = c("Probes", "Change", "Max_LFC_RAS"))
+colnames(zscore_transcriptomic_data) <- c( "Probe", "Change", "Max_LFC_RAS", "Day", "Exprs")
+zscore_transcriptomic_data$Combine <- paste(zscore_transcriptomic_data$Day,
+                                            zscore_transcriptomic_data$Change, sep = "_")
+
+
+#--> Plot expression trajectories
+colors  <- c("#FF0000", "#00B9FF", "#1430B3", "#5B03F7", "#E800FF", "#FF008B")
+#zscore_transcriptomic_data$Change <- gsub("denovo_notzero|denovo_zero",
+#                                        "denovo",zscore_transcriptomic_data$Change )
+ggplot(data = zscore_transcriptomic_data) +
+  geom_boxplot(aes(x = Day, y = Exprs, group = Day, fill = Day)) + 
+  scale_fill_manual(values = colors) +
+  facet_wrap(~Change, nrow = 2) +
+  theme_classic() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        axis.text.y = element_text(size = 8),
+        strip.text.x = element_text(size = 6),
+        legend.position="none")
+```
+
+```{r, fig.cap="Distribution of leading logFC for genes associated with the different class of enhancers", fig.height=6}
+#--> Plot FC
+ggplot(data = zscore_transcriptomic_data, aes(x = Change, y = Max_LFC_RAS)) +
+  stat_summary(geom="point",  position = "dodge") +
+  stat_summary(geom="errorbar",  position = "dodge") +
+  theme_classic() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        axis.text.y = element_text(size = 8),
+        strip.text.x = element_text(size = 6))
+```
+
+## Impact of the number of de novo window on FC
+
+```{r,  fig.cap="Relationship between the number of "de novo enhancer" flagged nucleosome and gene expression change", fig.height=6}
+library(fields)
+
+#### split denovo
+denovo_enh <- diff_segment_selec[which(diff_segment_selec$combination == "D0_Unmarked_D3_Unmarked_D6_Active_Enh" |
+                                       diff_segment_selec$combination == "D0_Unmarked_D3_Active_Enh_D6_Active_Enh" |
+                                       diff_segment_selec$combination == "D0_Unmarked_D3_Poised_Enh_D6_Active_Enh")] 
+denovo_enh_w <- tile(denovo_enh, width = 100) # Give a GRangesList
+denovo_enh_w  <- unlist(flatGrl(denovo_enh_w))   # Transform GRangesList to GRanges
+
+peaks_2 <- subsetByOverlaps(peaks, denovo_enh_w)
+
+
+#--> Annotate transitions (assigning closest genes) 
+state_change_annot <- annotatePeakInBatch(peaks,AnnotationData = annot_state,
+                                          output = "nearestLocation")
+mcols(state_change_annot) <- data.frame(mcols(state_change_annot),  
+                                        mcols(annot_state[as.numeric(mcols(state_change_annot)$feature)]))
+state_change_annot$mcols.probes <- gsub("hg.1$", "hg", state_change_annot$mcols.probes)
+state_change_annot$n_window <- countOverlaps(state_change_annot, denovo_enh_w)
+state_change_annot_2 <- state_change_annot
+
+#--> Merge with transcriptomic data
+data_transcriptome_zscore <- data.frame(Row.names = data_transcriptome[,1],
+                                        t((t(data_transcriptome[,c(2:7)]))),
+                                        data_transcriptome[,c(8:13)])
+state_change_expression <- data.frame(merge(data_transcriptome_zscore,
+                                 mcols(state_change_annot_2),
+                                 by.x = "Row.names", by.y = "mcols.probes" ))
+
+#state_change_expression <- state_change_expression[-which(state_change_expression$Change == "STABLE"),]
+state_change_expression <- unique(state_change_expression)
+
+# Group by classes
+state_change_expression$n_w <- NULL
+state_change_expression$n_w[which(state_change_expression$n_window == 0)] <- "a"
+
+state_change_expression$n_w[which(state_change_expression$n_window >=1 &
+                                  state_change_expression$n_window < 2)]  <- "b"
+
+state_change_expression$n_w[which(state_change_expression$n_window >=2 &
+                                  state_change_expression$n_window < 3)]  <- "c"
+
+state_change_expression$n_w[which(state_change_expression$n_window >=3 &
+                                  state_change_expression$n_window < 4)]  <- "d"
+
+state_change_expression$n_w[which(state_change_expression$n_window >=4 &
+                                  state_change_expression$n_window < 5)]  <- "e"
+
+state_change_expression$n_w[which(state_change_expression$n_window >=5 &
+                                  state_change_expression$n_window < 10)]  <- "f"
+
+state_change_expression$n_w[which(state_change_expression$n_window >=10 &
+                                  state_change_expression$n_window < 15)]  <- "g"
+
+state_change_expression$n_w[which(state_change_expression$n_window >= 15)] <- "h"
+
+
+state_change_expression <- unique(state_change_expression)
+
+#--> Plot
+ggplot() +
+  geom_boxplot(data = state_change_expression, aes(x =n_w, y = abs(Max_LFC_RAS), group = n_w, fill = n_w), outlier.shape = NA) + 
+  scale_fill_manual(values = tim.colors(8)) +
+  scale_y_continuous(limits = quantile(abs(state_change_expression$Max_LFC_RAS), c(0.01, 0.99))) +
+  theme_classic() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        axis.text.y = element_text(size = 8),
+        strip.text.x = element_text(size = 6))
+
+```
+
+# Focus on de novo enhancers
+
+## Epigenomic environment
+
+```{r, fig.cap="Evolution of the epigenetic environment of de novo enhancers", fig.height=6}
+###### EPIGENETIC ENVIRONMENT OF VIRGIN / NOOKMARKED DE NOVO ENHANCER
+
+denovo_enh_notzero_window <- granges(subsetByOverlaps(denovo_enh_w, denovo_enh_notzero))
+denovo_enh_notzero_window$Change <- "denovo_notzero"
+denovo_enh_zero_window <- granges(subsetByOverlaps(denovo_enh_w, denovo_enh_zero))
+denovo_enh_zero_window$Change <- "denovo_zero"
+
+target_select_metaprofiles <- c(denovo_enh_notzero_window,
+                                denovo_enh_zero_window,
+                                poised_enh_w)
+seqlevels(target_select_metaprofiles) <- seqlevelsInUse(target_select_metaprofiles)
+target_select_metaprofiles$Change <- factor(target_select_metaprofiles$Change, levels = c("denovo_notzero", "denovo_zero", "poised"))
+
+tss_gr <- resize(target_select_metaprofiles , 500000, fix = "center")
+
+tss_split <- tile(tss_gr, n = 1000) # Give a GRangesList
+tss_split <- unlist(flatGrl(tss_split))   # Transform GRangesList to GRanges
+
+# Density in active enhancers at D0 
+active_enh_T0   <- segment_cond[which(segment_cond$state.D0 == "Active_Enh")]
+active_enh_72H  <- segment_cond[which(segment_cond$state.D3 == "Active_Enh")]
+active_enh_144H <- segment_cond[which(segment_cond$state.D6 == "Active_Enh")]
+hit <- list()
+
+hit[[1]] <- t(matrix(countOverlaps(tss_split, constitutive_enh_w ),  nrow = 1000))
+hit[[1]] <- t(matrix(countOverlaps(tss_split, active_enh_T0),  nrow = 1000))
+hit[[2]] <- t(matrix(countOverlaps(tss_split, active_enh_72H),  nrow = 1000))
+hit[[3]] <- t(matrix(countOverlaps(tss_split, active_enh_144H),  nrow = 1000))
+
+count_list <- list()
+for (i in c(1:3)) {
+  tmp <- hit[[i]]
+  tmp_list <- list()
+  for (j in levels(as.factor(tss_gr$Change))) {
+    tmp_2 <- tmp[which(tss_gr$Change == j),]
+    tmp_list[[j]] <- apply(tmp_2, 2, function(x) {length(which(x > 0)) / length(x) * 100})
+  }
+  count_list[[i]] <- tmp_list
+}
+
+names(count_list) <- c("T0", "72H", "144H")
+count_list_r <- melt(count_list)
+count_list_r$pos <- rep(1:1000)
+colnames(count_list_r) <- c("value", "type","day",  "pos")
+
+ggplot(count_list_r, aes(x = pos, y = value, group = day, color = day)) +
+  geom_line(data = count_list_r,size = .5) +
+  facet_grid(~type) + 
+  scale_x_continuous(limits = c(400,600)) +
+  theme_classic()
+
+```
+
+## Integration with transcriptomic data
+
+```{r, fig.cap="Absolute expression profiles for genes associated with the different class of enhancers", fig.height=6}
+#---> Load the oligo package and the HTA 2.0 annotation packages
+library(oligo)
+library(pd.hta.2.0)
+
+#---> List .cel files
+celFiles <- list.celfiles("./data/Transcriptome/", full.name = TRUE)
+celFiles <- celFiles[c(1:12, 13, 15:18, 14, 19, 21:24, 20)]
+
+#---> Read .cel files
+data_raw_cel <- read.celfiles(celFiles)
+colnames(data_raw_cel) <- c("Q_1_0", "Q_1_12", "Q_1_24",
+                            "Q_1_48","Q_1_72", "Q_1_96",
+                            "Q_2_0", "Q_2_12", "Q_2_24",
+                            "Q_2_48", "Q_2_72", "Q_2_96",
+                            "RAS_1_0", "RAS_1_24", "RAS_1_48",
+                            "RAS_1_72", "RAS_1_96", "RAS_1_144",
+                            "RAS_2_0", "RAS_2_24", "RAS_2_48",
+                            "RAS_2_72", "RAS_2_96", "RAS_2_144")
+
+#---> Get RMA normalized expression values at the gene level (target = "core")
+data_rma <- rma(data_raw_cel,
+                background = TRUE,
+                normalize = TRUE,
+                target = "core")
+
+data_transcriptome <- exprs(data_rma)
+
+#--> Annotate transitions (assigning closest genes) 
+annot_state <-  read.table("./tools/MICROARRAY_ANNOTATION_BIOCONDUCTOR.txt", header = TRUE, sep ="\t")
+
+#--> Annotate transitions (assigning closest genes) 
+annot_state <- annot_state[-which(is.na(annot_state$Chromosome) | is.na(annot_state$Start)),]
+annot_state <- GRanges(seqnames = paste("chr", annot_state$Chromosome, sep = ""),
+                      IRanges(start = annot_state$Start, end = annot_state$Start),
+                      mcols = data.frame(probes = as.character(annot_state$Probe_ID),
+                                         gene = as.character(annot_state$HGNC_Symbol)))
+
+state_change_annot <- annotatePeakInBatch(target_select_metaprofiles,
+                                          AnnotationData = annot_state,
+                                          output = "nearestLocation")
+
+mcols(state_change_annot) <- data.frame(mcols(state_change_annot),  
+                                        mcols(annot_state[as.numeric(mcols(state_change_annot)$feature)]))
+state_change_annot$mcols.probes <- gsub("hg.1$", "hg", state_change_annot$mcols.probes)
+
+#--> Merge with unfitered transcriptomic data
+data_transcriptome <- data.frame(Row.names = row.names(data_transcriptome),
+                                        data_transcriptome[,c(13:18)])
+data_transcriptome$Row.names <- gsub("hg.1$", "hg", data_transcriptome$Row.names)
+data_transcriptome <- merge(data_transcriptome,
+                                 mcols(state_change_annot),
+                                 by.x = "Row.names", by.y = "mcols.probes")
+
+#--> Compute FC
+
+get_max_absolut_FC <- function (x) {
+  fc <- x[1:6] - x[1]
+  max_fc <- max(fc)
+  min_fc <- min(fc)
+  if (abs(max_fc) > abs(min_fc)) {abs_fc <- max_fc}
+  if (abs(max_fc) < abs(min_fc)) {abs_fc <- min_fc}
+  return(abs_fc)
+}
+
+data_transcriptome$FC <- apply(as.matrix(data_transcriptome[,c(2:7)]), 1, get_max_absolut_FC)
+data_transcriptome <- data_transcriptome[,c("RAS_1_0", "RAS_1_24", "RAS_1_48",
+                                                      "RAS_1_72", "RAS_1_96","RAS_1_144",
+                                                      "Row.names", "Change", "FC")]
+colnames(data_transcriptome) <- c("D0", "D1", "D2", "D3", "D4", "D6", "Probes", "Change", "FC")
+
+data_transcriptome <- melt(data.frame(data_transcriptome), id.vars = c("Probes", "Change", "FC"))
+colnames(data_transcriptome) <- c( "Probe", "Change", "FC", "Day", "Exprs")
+data_transcriptome$Combine <- paste(data_transcriptome$Day,
+                                    data_transcriptome$Change, sep = "_")
+
+colors  <- c("#FF0000", "#00B9FF", "#1430B3", "#5B03F7", "#E800FF", "#FF008B")
+
+
+ggplot(data = data_transcriptome, aes(x = Day , y = Exprs, color = Change)) +
+  stat_summary(geom="line") +
+  stat_summary(geom="point",  position = "dodge") +
+  stat_summary(geom="errorbar",  position = "dodge") +
+  theme_classic() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        axis.text.y = element_text(size = 8),
+        strip.text.x = element_text(size = 6))
+
+```
+
+# Session Info
+
+```{r, eval = TRUE, results = 'markup', message = TRUE, echo = TRUE,}
+sessionInfo()
+```
+

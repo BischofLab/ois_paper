@@ -1,0 +1,1306 @@
+---
+title: "Integrative multiomic profiling reveals epigenetic precoding, transcription factor hierarchies and reprogrammability of the senescent state"
+subtitle: "Appendix A : Analyses of transcriptomic data"
+date: ""
+
+output:
+   BiocStyle::html_document:
+    theme: cosmo
+    highlight:  "tango"
+    toc: true
+    toc_float:
+      toc_collapsed: true
+    toc_depth: 2
+    number_sections: true
+    code_folding: 'show'
+    df_print: paged
+    keep_md: true
+abstract: |
+---
+
+\pagebreak
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE, eval = TRUE, results = "hide", message = FALSE, warning = FALSE, echo = TRUE, fig.wide = TRUE,  fig.align='center')
+```
+
+# Preprocessing
+
+Raw Affymetrix HTA 2.0 array intensity data were analyzed using open-source Bioconductor packages on R. The quiescence and the RAS OIS time series data were normalized all together (2 coenditions, 2 biological replicates per condition, 6 time points per replicates) using the robust multi-array average normalization approach implemented in the `r Biocpkg("oligo")` package. Internal control probe sets were removed and average expression deciles over time-points were then defined independently for each treatment. Probes whose average expression was lower than the 4th expression decile in both conditions were removed for subsequent analyses. To remove sources of unwanted variation and consider batch effects, data were finally corrected with the `r Biocpkg("sva")` package. Probes were then annotated using the information provided by Ensembl through  `r Biocpkg("biomaRt")`. Principal component analysis and bi-clustering based on Pearson’s correlation and Ward’s aggregation criterion were used to check for consistency between biological replicates and experimental conditions at each step of the pre-processing.
+
+## Locating data on GEO
+
+The transcriptomic data related to our study are available on Gene Expression Omnibus under the accession GSE112084.
+
+## Importing raw data
+
+Before starting the analysis, we need to load the data that are stored in the .CEL Affymetrix proprietary format. To be able to load this format in *R*, we first need to load the `r Biocpkg("oligo")` package, and the annotation package `r Biocpkg("pd.hta.2.0")` related to the array type we are working on (here, Human Transcriptome Array 2.0, *aka* HTA 2.0). In this analysis, we will work at the gene level.
+
+```{r}
+#---> Load the oligo package and the HTA 2.0 annotation packages
+library(oligo)
+library(pd.hta.2.0)
+
+#---> List .cel files
+celFiles <- list.celfiles("./data/Transcriptome/", full.name = TRUE)
+celFiles <- celFiles[c(1:12, 13, 15:18, 14, 19, 21:24, 20)]
+
+#---> Read .cel files
+data_raw_cel <- read.celfiles(celFiles)
+colnames(data_raw_cel) <- c("Q_1_0", "Q_1_12", "Q_1_24",
+                            "Q_1_48","Q_1_72", "Q_1_96",
+                            "Q_2_0", "Q_2_12", "Q_2_24",
+                            "Q_2_48", "Q_2_72", "Q_2_96",
+                            "RAS_1_0", "RAS_1_24", "RAS_1_48",
+                            "RAS_1_72", "RAS_1_96", "RAS_1_144",
+                            "RAS_2_0", "RAS_2_24", "RAS_2_48",
+                            "RAS_2_72", "RAS_2_96", "RAS_2_144")
+```
+
+## Getting annotations
+
+The whole probeset on the array are annotated using the infomation (associated gene HGNC symbols, Entrez IDs, and genomic coordinates on the genome assembly GRCh38.p7 *aka* hg38),provided on the Ensembl database (version 86 - October 2016) through the package `r Biocpkg("biomaRt")` as well as from the Bioconductor annotation package `r Biocpkg("hta20transcriptcluster.dbt")`.
+
+### Ensembl annotation
+
+```{r}
+#--->  Load the package biomaRt
+library(biomaRt)
+
+#--->  Creating the biomaRt connexion with the Ensembl v86 hg38 genome annotation
+mart <- useEnsembl(biomart="ensembl",dataset="hsapiens_gene_ensembl", version=86)
+
+#--->  Querying Ensembl to map probe names to various features
+annotation_emsembl <- getBM(mart = mart,
+                            attributes = c("affy_hta_2_0",
+                                          "ensembl_gene_id",
+                                          "chromosome_name",
+                                          "start_position",
+                                          "end_position",
+                                          "strand",
+                                          "entrezgene",
+                                          "hgnc_symbol"))
+
+write.table(annotation_emsembl, "./results/MICROARRAY_ANNOTATION_ENSEMBL.txt",
+            quote = FALSE, col.names = TRUE, row.names = FALSE, sep = "\t")
+```
+
+### Bioconductor annotation
+
+```{r}
+# Load the package Bioconductor
+library(hta20transcriptcluster.db)
+
+probes <- keys(hta20transcriptcluster.db)
+
+# Mapping between probe names and HGNC gene symbols
+symbol <- mapIds(hta20transcriptcluster.db,
+                 keys = probes,
+                 keytype = "PROBEID",
+                 column = "SYMBOL")
+
+# Mapping between probe names and gene Entrez gene IDs
+entrez <- mapIds(hta20transcriptcluster.db,
+                 keys = probes,
+                 keytype = "PROBEID",
+                 column = "ENTREZID")
+
+# Mapping between probe names and gene Ensembl gene IDs
+ensembl <- mapIds(hta20transcriptcluster.db,
+                  keys = probes,
+                  keytype = "PROBEID",
+                  column = "ENSEMBL")
+
+# Mapping between probe names and chromosome the gene is located in 
+chromosome <- mapIds(hta20transcriptcluster.db,
+                     keys = probes,
+                     keytype = "PROBEID",
+                     column = "CHR")
+
+# Mapping between probe names and gene start (bp)
+start <- abs(as.numeric(mapIds(hta20transcriptcluster.db,
+                    keys = probes,
+                    keytype = "PROBEID",
+                    column = "CHRLOC")))
+
+# Mapping between probe names and gene end (bp)
+stop <- abs(as.numeric(mapIds(hta20transcriptcluster.db,
+                   keys = probes,
+                   keytype = "PROBEID",
+                   column = "CHRLOCEND")))
+
+# Creating a global annotation matrix
+annotation_bioconductor <- data.frame(Probe_ID = probes,
+                                      Ensembl_ID = ensembl,
+                                      Entrez_ID = entrez,
+                                      HGNC_Symbol = symbol,
+                                      Chromosome = chromosome,
+                                      Start = start,
+                                      Stop = stop,
+                                      stringsAsFactors = FALSE)
+
+# Formating
+annotation_bioconductor$Probe_ID <- gsub("hg.1$", "hg", annotation_bioconductor$Probe_ID)
+
+# Exporting
+write.table(annotation_bioconductor, "./results/MICROARRAY_ANNOTATION_BIOCONDUCTOR.txt",
+            quote = FALSE, col.names = TRUE, row.names = FALSE, sep = "\t")
+```
+
+## Applying robust multi-array normalization
+
+Once the data are loaded, we can run the Robust Multiarray Normalization (RMA). This type of normalization is supported by the package `r Biocpkg("oligo")`. This procedure, which include a quantile normalization approach, aimed to polish the median expression between arrays. Notice the use of the option `target = "core"` which set the analysis at the gene level.
+
+```{r}
+#---> Get raw expression values
+data_raw  <- rma(data_raw_cel,
+                 background = FALSE,
+                 normalize = FALSE,
+                 target = "core")
+
+#---> Get RMA normalized expression values at the gene level (target = "core")
+data_rma <- rma(data_raw_cel,
+                background = TRUE,
+                normalize = TRUE,
+                target = "core")
+
+```
+
+## Removing control and lowly expressed probesets
+
+To avoid considering irrelevant probesets in forthcoming analyses, it is important to filter the expression matrix obtained after applying the RMA. There are two kinds of probesets we want to remove :
+
+* internal Affymetrix control probesets: we can easily find their IDs in the annotation package `r Biocpkg("pd.hta.2.0")`;
+* lowly expressed probesets: one empirical rule that is usually applied when working with transcriptomic microarray data is to consider that, in any given tissue - cell type - condition, up to 60-80% of the genes are expressed. To get rid of most of the noise, we decided to apply the 60% cutoff.
+
+
+```{r}
+#---> Get probe names and probe types on the array
+array <- db(pd.hta.2.0) 
+
+#--->Select internal control probesets
+probes <- dbGetQuery(array, "select * from featureSet;")
+
+#---> Get their position on the expression matrix
+match <- match(probes$man_fsetid, row.names(data_rma))
+
+#---> Remove them
+data_rma <- data_rma[-match[-which(is.na(match))],]
+
+#---> Get expression quantiles
+quantile_Q   <- quantile(oligo::exprs(data_rma)[,(c(1:12))], seq(0, 1, .05))[9]
+quantile_RAS <- quantile(oligo::exprs(data_rma)[,(c(13:24))], seq(0, 1, .05))[9]
+
+#---> Filter lowly expressed probe
+filter_Q   <- apply(oligo::exprs(data_rma)[,(c(1:12))], 1, mean) < quantile_Q
+filter_RAS <-apply(oligo::exprs(data_rma)[,(c(13:24))], 1, mean) < quantile_RAS
+filter     <- filter_Q & filter_RAS
+data_rma   <- data_rma[-which(filter == TRUE),]
+
+#---> Modify probe names
+row.names(data_rma) <- gsub( ".1$", "", row.names(data_rma))
+```
+
+## Visual inspection of RMA effect
+
+After these pre-processings, to properly evaluate the impact of the RMA, it is important to graphically visualize the data before and after normalization. Several visual exploration should be used :
+
+* Box plot;
+* Unsupervised clustering;
+* PCA.
+  
+### Boxplot
+
+The boxplot is the method of choice to visualize the median polishing applied by the RMA. 
+
+```{r, fig.cap= "Box plot : Effect of RMA normalization", fig.height=8.5}
+#--->  Load the packages reshape2, ggplot2 and gridExtra
+library(reshape2)
+library(ggplot2)
+library(gridExtra)
+
+#--->  Prepare the data
+data_before_rma <- melt(oligo::exprs(data_raw), varnames = c("Probe", "Sample"))
+data_before_rma$Sample <- factor(data_before_rma$Sample , levels = colnames(data_raw_cel))
+data_before_rma$Condition <- gsub("_1_|_2_", "_", data_before_rma$Sample)
+
+data_after_rma  <- melt(oligo::exprs(data_rma), varnames = c("Probe", "Sample"))
+data_after_rma$Sample <- factor(data_after_rma$Sample , levels = colnames(data_raw_cel))
+data_after_rma$Condition <- gsub("_1_|_2_", "_", data_after_rma$Sample)
+
+#--->  Boxplot before RMA
+P1 <- ggplot(data_before_rma, aes(y  = value, x = Sample, fill = Condition)) +
+        geom_boxplot(show.legend=F) +
+        theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+        ggtitle("Signal distribution - Before RMA")
+
+#--->  Boxplot after RMA
+P2 <- ggplot(data_after_rma, aes(y  = value, x = Sample, fill = Condition)) +
+        geom_boxplot(show.legend=F) +
+        theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+        ggtitle("Signal distribution - After RMA")
+
+#--->  Combine the 2 plots
+grid.arrange(P1,P2)
+```
+
+### Clustering
+
+The biclustering based on sample correlations can be usefull to highlight relationships between sample and potential artifacts, espcially regarding batch effect, which would need to be taken into account in subsequent analyses.
+To run a clustering and plot a dendrogram, we first need to define :
+
+* The distance metric we want to use. For gene expression analysis, we usually use `1 - cor(method = "pearson")`.
+* The aggreagation criterion. Here we will use the Ward's D2 distance.
+
+```{r, fig.cap= "Clustering : Effect of RMA normalization", fig.height=15}
+#--->  Load the package pheatmap
+library(pheatmap)
+
+#--->  Heatmap before RMA using Ward's D2 distance and Pearson's correlation
+P1 <- pheatmap(cor(oligo::exprs(data_raw)),
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation",
+         clustering_method = "ward.D2", silent = TRUE,
+         main = "Clustering - Before RMA")
+
+#--->  Heatmap after RMA using Ward's D2 distance and Pearson's correlation
+P2 <- pheatmap(cor(oligo::exprs(data_rma)),
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation",
+         clustering_method = "ward.D2", silent = TRUE,
+         main = "Clustering - After RMA")
+
+#--->  Combine the 2 plots
+do.call(grid.arrange,list(P1[[4]],P2[[4]]))
+```
+
+Overall, what we see here is that either before or after RMA, the structure of the dataset is consistent and separate quite well the two treatments (quiescence time-courses (Q) and RAS time courses (RAS)). The RMA allowed to gain further in consistency, and to regain  the expected proximity between the initial time points for the quiescence time-cousrse (Q_0) and the RAS timecourses (RAS_0). Nevetheless, we still see some unintended substructures in the correlation matrix after RMA, with samples clustered together by batch rahter than time-points. We should take these artefacts into account before moving forward and remove the variability that is explained by the day the array were processed. 
+
+## Removing the batch effect
+
+To remove the batch effect, we will use the package `r Biocpkg("sva")`.
+We need to define :
+
+* `mod`: which corresponds to the model matrix being used to fit the data and including the biological parameters (here: *treatment* and *time*);
+* `mod0`: which correspondes to the null model being compared when fitting the data and including batch parameters. 
+
+```{r}
+#--->  Load the packages sva and limma 
+library(sva)
+library(limma)
+
+#---> Define the model matrix
+design <- model.matrix(~factor(c("T_0", "Q_12", "Q_24", "Q_48", "Q_72", "Q_96",
+                                 "T_0", "Q_12", "Q_24", "Q_48", "Q_72", "Q_96",
+                                 "T_0", "RAS_24", "RAS_48", "RAS_72", "RAS_96", "RAS_144",
+                                 "T_0", "RAS_24", "RAS_48", "RAS_72", "RAS_96", "RAS_144"),
+                               levels= c("T_0","Q_12","Q_24", "Q_48", "Q_72", "Q_96",
+                                         "RAS_24", "RAS_48", "RAS_72", "RAS_96", "RAS_144")))
+
+
+#---> Define the null model
+mod0 <- model.matrix(~factor(factor(rep(c(1:4), each = 6))))
+
+#---> Estimate surrogate variables 
+sv.obj <- sva(oligo::exprs(data_rma), mod = design, mod0 = mod0)
+
+#---> Correct the data
+mod.sv <- cbind(design, sv.obj$sv)
+fit.sv <- lmFit(oligo::exprs(data_rma),mod.sv)
+mod.sv.2 <- coefficients(fit.sv)[,12:14] %*% t(sv.obj$sv)
+data_rma_no_batch <- oligo::exprs(data_rma) - mod.sv.2
+
+```
+
+## Visual inspection of batch effect correction
+
+To properly evaluate the impact of the batch effect correction, it is once again important to graphically visualize the data before and after transformation.
+
+### Clustering
+
+```{r, fig.cap= "Clustering : Effect of batch effect correction", fig.height=15}
+#--->  Heatmap after RMA using Ward's distance
+P1 <- pheatmap(cor(oligo::exprs(data_rma)),
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation",
+         clustering_method = "ward.D2", silent = TRUE,
+         main = "Clustering - After RMA")
+
+#--->  Heatmap after RMA + SVA using Ward's distance
+P2 <- pheatmap(cor(data_rma_no_batch),
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation",
+         clustering_method = "ward.D2", silent = TRUE,
+         main = "Clustering - After RMA + SVA")
+
+do.call(grid.arrange,list(P1[[4]],P2[[4]]))
+```
+
+In this dendrogram, we can clearly see the batch effect has been properly removed. All the array belonging to the first batch (with the suffix _1) are not clustered together any more. Instead, arrays that are the replication of a given time point tend to cluster together and appears less distant.
+
+### Principal Component Analysis
+
+```{r, fig.cap= "PCA : Effect of batch effect correction", fig.height=15}
+#--->  Load the package ggrepel
+library(ggrepel)
+
+#--->  Creating the expression matrices
+data_pca_before_sva <- oligo::exprs(data_rma)     
+data_pca_after_sva  <- data_rma_no_batch
+
+#--->  Creating a vector representing the two replicates
+batch     <- as.factor(c(rep(seq(from = 1, to = 4), each = 6)))
+treatment <- as.factor(c(rep("Q", 12), rep("RAS", 12)))
+
+#--->  Computing PCA
+pca_before_sva   <- as.data.frame(prcomp(t(na.omit(data_pca_before_sva)))$x)
+pca_after_sva    <- as.data.frame(prcomp(t(na.omit(data_pca_after_sva)))$x) 
+
+
+#--->  Ploting the first two PC before removal of the batch effect
+pca_plot_before_sva <- ggplot(pca_before_sva, aes(x= PC1, y = PC2, label = row.names(pca_before_sva))) + 
+                       geom_point(aes(color = batch)) +
+                       geom_text_repel(force = 5) +
+                       ggtitle("PCA - After RMA")
+
+#--->  Ploting the first two PC after removal of the batch effect     
+pca_plot_after_sva <- ggplot(pca_after_sva, aes(x= PC1, y = PC2, label = row.names(pca_before_sva))) + 
+                       geom_point(aes(color = batch)) +
+                       geom_text_repel(force = 5) +
+                       ggtitle("PCA - After RMA + SVA")
+
+#--->  Combining the two plots
+grid.arrange(pca_plot_before_sva , pca_plot_after_sva, nrow=2)
+```
+
+### Multi-Dimensional Scaling
+
+```{r,  fig.cap= "MDS : RAS OIS and quiescence transcriptomic trajectories", fig.align='left', fig.height=10}
+#--->  Creating the expression matrices
+data_mds  <- data_rma_no_batch
+
+#--->  Creating a vector representing the two replicates
+treatment <- factor(c("T_0", "Q_12", "Q_24", "Q_48", "Q_72", "Q_96",
+                      "T_0", "Q_12", "Q_24", "Q_48", "Q_72", "Q_96",
+                      "T_0", "RAS_24", "RAS_48", "RAS_72", "RAS_96", "RAS_144",
+                      "T_0", "RAS_24", "RAS_48", "RAS_72", "RAS_96", "RAS_144"),
+                    levels= c("T_0","Q_12","Q_24", "Q_48", "Q_72", "Q_96",
+                              "RAS_24", "RAS_48", "RAS_72", "RAS_96", "RAS_144"))
+
+#--->  Computing MDS
+mds <- plotMDS(data_mds@.Data, plot = FALSE)
+mds  <- data.frame(Name = names(mds$x),
+                   X = mds$x, 
+                   Y = mds$y)
+
+#--->  Ploting the first two PC before removal of the batch effect
+mds_plot <- ggplot( mds, aes(x= X, y = Y, label = mds$Name)) + 
+                       geom_point(aes(color = treatment)) +
+                       geom_text_repel(force = 5) +
+                       ggtitle("MDS - After RMA + SVA")
+mds_plot 
+```
+
+
+# Self organizing maps
+
+Normalized log-scaled and filtered expression values were processed using the unsupervised machine learning method implemented in `r Biocpkg("oposSOM")` to train a self-organizing map (SOM). This algorithm applies a neural network algorithm to project high dimensional data onto a two-dimensional visualization space. In this application, we used a two-dimensional grid of size 60 x 60 metagenes of rectangular topology.
+
+## Prepare and run the SOM workflow
+
+```{r, eval = FALSE}
+#--->  Load the package oposSOM
+library(oposSOM)
+
+#--->  Create the oposSOM environment
+opossum_env <- opossom.new(list(dataset.name = "Senescence", 
+                                dim.1stLvlSom=60,
+                                database.biomart = "ENSEMBL_MART_ENSEMBL",
+                                database.host = "jul2015.archive.ensembl.org",
+                                database.dataset = "hsapiens_gene_ensembl",
+                                database.id.type = "affy_hta_2_0"))
+
+#--->  Define Metainformation
+colors <- rainbow(11)
+group_info <- data.frame(group.labels = c("T_0", "Q_12", "Q_24", "Q_48", "Q_72", "Q_96",
+                                          "T_0", "Q_12", "Q_24", "Q_48", "Q_72", "Q_96",
+                                          "T_0", "RAS_24", "RAS_48", "RAS_72", "RAS_96", "RAS_144",
+                                          "T_0", "RAS_24", "RAS_48", "RAS_72", "RAS_96", "RAS_144"),
+                         group.colors = c(colors[c(1, 2:6)],
+                                          colors[c(1, 2:6)],
+                                          colors[c(1, 7:11)],
+                                          colors[c(1, 7:11)]),
+                         row.names = colnames(data_rma_no_batch))
+
+#--->  Create the ExpressionSet
+som_data <-  ExpressionSet(assayData = data_rma_no_batch,
+                           phenoData = AnnotatedDataFrame(group_info))
+
+#--->  Create the oposSOM environment
+library(biomaRt)
+opossum_env$indata <- som_data 
+
+#--->  Run the oposSOM analysis
+opossom.run(opossum_env)
+```
+
+## Explore SOM outputs
+
+### Expression portraits
+
+The SOM portraits were then plotted using a logarithmic fold-change scale.
+
+```{r, fig.cap= "SOM : Expression portraits", fig.align='left', fig.height=8}
+#--->  Load data
+load("./results/SOM/Senescence.RData")
+
+#--->  Create a vector with information on samples
+group_info <- c("T_0", "Q_12", "Q_24", "Q_48", "Q_72", "Q_96",
+                "T_0", "Q_12", "Q_24", "Q_48", "Q_72", "Q_96",
+                "T_0", "RAS_24", "RAS_48", "RAS_72", "RAS_96", "RAS_144",
+                "T_0", "RAS_24", "RAS_48", "RAS_72", "RAS_96", "RAS_144")
+
+#---> Get the expression portaits data and format
+data_som_portrait <- env$metadata
+data_som_portrait <- melt(data_som_portrait, varnames = c("X", "Sample"))
+data_som_portrait$Condition <- factor(rep(group_info, each = 3600),
+                                      levels = unique(group_info))
+data_som_portrait$X <- rep(c(1:60))
+data_som_portrait$Y <- rep(c(1:60), each = 60)
+
+#---> Plot expression portaits
+ggplot(data = data_som_portrait, aes(x=X, y=Y)) + 
+    geom_tile(aes(fill=value)) +
+    scale_fill_gradientn(colours = env$color.palette.portraits(1000)) +
+    facet_wrap(~Condition, scales = "free") 
+
+```
+
+### D-cluster
+
+To define modules of co-expressed meta-genes, we used a clustering approach relying on distance matrix and implemented in oposSOM. Briefly, clusters of gene expression were determined based on the patterns of the distance map which visualizes the mean Euclidean distance of each SOM unit to its adjacent neighbors. This clustering algorithm finds the SOM units referring to local maxima of their mean distance with respect to their neighbors. These pixels form halos edging the relevant clusters in the respective distance map and enable robust determination of feature clusters in the SOM.
+
+```{r, fig.cap= "SOM : D-cluster projection", fig.height=4, fig.width=5, fig.wide = TRUE}
+#---> Get the D-cluster data and format
+data_d_cluster <- data.frame(D_cluster = as.factor(env$spot.list.dmap$overview.mask),
+                             X = rep(c(1:60)),
+                             Y = rep(c(1:60), each = 60))
+levels(data_d_cluster$D_cluster) <- LETTERS[seq( from = 1, to = 10 )]
+
+#---> Plot D-clusters
+ggplot(data = data_d_cluster, aes(x=X, y=Y)) + 
+       geom_tile(aes(fill=D_cluster)) + 
+       scale_fill_discrete(na.value = "transparent")
+```
+
+### Expression profiles
+
+```{r, fig.cap= "SOM : Expression profiles of each D-cluster", fig.height=10}
+#---> Get the expression data
+data_d_cluster_genes <- env$spot.list.dmap$spots
+
+#---> Format
+get_expression_data_per_d_luster <- function(d_clust) {
+  probe_list  <- d_clust$genes
+  probe_exprs <- env$indata[match(probe_list, row.names(env$indata)),]
+}
+
+data_d_cluster_genes <- lapply(data_d_cluster_genes, get_expression_data_per_d_luster)
+data_d_cluster_genes <- melt(data_d_cluster_genes)
+colnames(data_d_cluster_genes) <- c("Probes", "Sample", "Expression", "D_cluster")
+
+data_d_cluster_genes$Type <- gsub("_1_|_2_", "_", data_d_cluster_genes$Sample)
+data_d_cluster_genes$Type[grep("Q_0|RAS_0", data_d_cluster_genes$Type)] <- "T0"
+data_d_cluster_genes$Type <- factor(data_d_cluster_genes$Type,
+                                    levels= unique(data_d_cluster_genes$Type))
+
+#---> Plot expression profiles
+ggplot(data = data_d_cluster_genes, aes(x=Sample, y=Expression, fill = Type)) + 
+       geom_bar(position = "dodge", stat = "summary", fun.y = "mean") +
+       facet_wrap(~D_cluster, ncol = 2, scales = "free_y") +
+       theme_bw() +
+       theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+### Functional over-representation
+
+We finally performed a gene set over-representation analysis in each cluster considering the MSigDB hallmark gene sets using a right-tail modified Fisher’s exact test and the hypergeometric distribution to provide p-value.
+
+```{r, results= "asis", echo = FALSE}
+#--->  Load the package data.table, dplyr and kableExtra
+library(data.table)
+library(dplyr)
+library(kableExtra)
+
+#---> Get the functional over-representation data
+data_d_cluster_overrepres <- env$spot.list.dmap$spots
+
+#---> Format
+get_overrepres_data_per_d_luster <- function(d_clust) {
+  overrepres  <- d_clust$Fisher.p[grep("HALLMARK", names(d_clust$Fisher.p))][c(1:5)]
+  overrepres <- data.frame(Pathway = names(overrepres), q_val = overrepres)
+}
+
+data_d_cluster_overrepres <- lapply(data_d_cluster_overrepres, get_overrepres_data_per_d_luster)
+data_d_cluster_overrepres <-  dplyr::bind_rows(data_d_cluster_overrepres, .id = 'source')
+colnames(data_d_cluster_overrepres)[1] <- "D_cluster"
+data_d_cluster_overrepres$Pathway <- gsub("HALLMARK_", "", data_d_cluster_overrepres$Pathway)
+data_d_cluster_overrepres$Pathway <- tolower(gsub("_", " ", data_d_cluster_overrepres$Pathway))
+
+#---> Create a table to display results
+data_d_cluster_overrepres %>%
+  mutate(
+    D_cluster = cell_spec(D_cluster, color = "white", align = "c", angle = -45, 
+                    background = factor(D_cluster, LETTERS[seq( from = 1, to = 10 )], rainbow(10))),
+    Pathway = Pathway,
+    q_val = cell_spec(round(-log10(q_val), digits = 3), color = ifelse(-log10(q_val) > 1, "red", "black"))
+  ) %>%
+  dplyr::select(D_cluster, Pathway, q_val) %>%
+  kable(escape = F, col.names = c("D cluster", "Pathways", "-log10(q)"), longtable = TRUE) %>%
+  kable_styling("striped", full_width = F, font_size = 8)
+    
+```
+
+# Information-theory based analyses
+
+To evaluate transcriptome diversity and specialization, we used the approaches derived from the information theory. Briefly, considering the relative expression of the $i^{th}$ gene in the $j^{th}$ tissue, we defined:
+
+* the transcriptome diversity as:
+
+$$H_j = \sum_{i=1}^g p_{ij} * log_2 (p_{ij})$$
+
+* the transcriptome specialization as:
+
+$$\sigma_j = \sum_{i=1}^g p_{ij} * S_i $$
+
+* with the gene specificity for the $i^{th}$ gene:
+
+$$S_i = \frac{1}{t} * \left( \sum_{j=1}^t \left( \frac {p_{ij}}{p_i} \right) * log_2\left(\frac {p_{ij}}{p_i}\right)\right) $$
+
+* and the average relative expression for the $i^{th}$ gene across samples:
+
+$$p_i = \frac{1}{t}*\sum_{j=1}^t p_{ij}$$
+
+
+```{r, fig.cap= "Information theory : Entropy vs specificity", fig.height=6, fig.width=7}
+#--->  Select data
+data_entropy <- data_rma_no_batch
+
+#--->  Relative Expression
+data_entropy <- data_entropy  / colSums(data_entropy)
+
+#--->  Diversity 
+Hj <- - colSums(data_entropy  * log2(data_entropy))
+
+#--->  Average relative gene expression
+Pi <- (1/24) * rowSums(data_entropy)
+
+#--->  Gene specificity
+Si <- (1/24) * rowSums((data_entropy / Pi) * log2((data_entropy / Pi)))
+
+#--->  Tissue Specialization
+Di <- colSums(data_entropy * Si)
+
+#--->  Divergence 
+Hrj <- - sum(Pi * log2(Pi))
+Dj <- Hrj - Hj
+
+
+entropy_vs_spe <- data.frame(Entropy = Hj,
+                           Specialization = Di*1000,
+                           Name = names(unlist(Hj)),
+                           Treatment = gsub("_.*$", "", names(unlist(Hj))),
+                           Time = gsub("^.*_.*_", "", names(unlist(Hj))),
+                           Time_F = rep(seq(0,5), 4),
+                           Type = paste(gsub("_.*$", "", names(unlist(Hj))),
+                                        gsub("^.*_", "", names(unlist(Hj))), sep = "_"),
+                           Group = as.factor(rep(seq(1, 4), each = 6)))
+
+ggplot(entropy_vs_spe , aes(x = Entropy, y = Specialization, col = as.factor(Type), label = Type)) +
+  geom_point() + geom_text_repel(color = "black") + theme_bw()
+
+```
+
+# Differential expression analysis
+
+Normalized log-scaled and filtered expression data related to the quiescence and the RAS OIS time series were further considered for differential analysis with `r Biocpkg("limma")`. To define a RAS OIS specific transcriptomic signature, we proceeded in three steps, each relying on linear mixed model cubic B-splines, as nonlinear response patterns are commonly encountered in time course biological data.
+
+* First, we defined probes responding over time to ER:RAS induction.
+* Second, we considered all together the quiescence and the RAS OIS time series, as well as the interaction between time and treatment, and defined probes responding to one or the other treatment over time, as well as probes responding differently between the two treatments at any time point.
+* We finally defined the set of probes responding consistently to both treatment and time and removed these probes from the global set of probes responding to the ER:RAS induction defined at the first step
+
+Moderated F-statistics that combine the empirical Bayes moderated t-statistics for all contrasts into an overall test of significance for each probe were used to assess the significance of the observed expression changes. At any step of this workflow, *p*-values were corrected for multiple testing using the FDR approach for a stringent significance level of 0.005.
+
+For validation purposes, we also wanted to compress the RAS OIS time-series and achieve a volcano plot representation. To do so, we’ve computed the maximal absolute log2 fold change in expression in the RAS OIS time series considering T0 as the reference and selected up and down regulated probes using an absolute log2 fold change cutoff at 1.2 and a corrected p-value cutoff of 0.005. We then build a scatter-plot plotting the log10 significance versus log2 fold-change on the y and x axes, respectively. Probes responding consistently to both ER:RAS induction and quiescence were finally over-plotted.
+
+
+## Design and splines
+
+```{r}
+# Design matrix
+design_full <- data.frame(Treatment = gsub("_.*", "", colnames(data_rma_no_batch)),
+                             Time = rep(c(0,1,2,3,4,5), 4),
+                             Batch = factor(rep(seq(from = 1, to = 4), each = 6)))
+
+design_RAS <- design_full[-c(1:12),]
+
+print(design_full )
+print(design_RAS)
+
+# Splines
+library(splines)
+design_splines_full <-  ns(design_full$Time, df = 3)
+design_splines_RAS  <-  ns(design_RAS$Time, df = 5)
+
+# Create a design matrix to test the effect of time on RAS timecourse only
+design_limma_RAS <- model.matrix(~ design_splines_RAS)
+
+# Create a design matrix to test the effect of time only, whatever the treatment
+design_limma_time <- model.matrix(~ design_full$Treatment + design_splines_full)
+
+# Create a design matrix to test the effect of time and treatment
+design_limma_full <- model.matrix(~ 0 + design_full$Batch + design_splines_full : design_full$Treatment)
+colnames(design_limma_full) <- gsub(":", ".", colnames(design_limma_full))
+colnames(design_limma_full) <- gsub("\\$", ".", colnames(design_limma_full))
+```
+
+## Fit the model to the data
+
+```{r}
+# Load the library limma
+library(limma)
+
+# Fit the models
+fit_limma_RAS  <- lmFit(data_rma_no_batch[,-c(1:12)], design_limma_RAS)
+fit_limma_time <- lmFit(data_rma, design_limma_time)
+fit_limma_full <- lmFit(data_rma, design_limma_full)
+
+##--> Genes DE through time during RAS timecourse
+fit_limma_RAS_2   <- eBayes(fit_limma_RAS)
+sig_limma_RAS     <- topTable(fit_limma_RAS_2, coef=c(2:6), adjust="BH", number = Inf, p.value = .005)
+sig_limma_RAS_all <- topTable(fit_limma_RAS_2, coef=c(2:6), adjust="BH", number = Inf)
+
+##--> Genes DE between treatment at any timepoint
+contrast_Q_vs_RAS <- makeContrasts(design_splines_full1.design_full.TreatmentQ -
+                                     design_splines_full1.design_full.TreatmentRAS,
+                                   design_splines_full2.design_full.TreatmentQ -
+                                     design_splines_full2.design_full.TreatmentRAS,
+                                   design_splines_full3.design_full.TreatmentQ -
+                                     design_splines_full3.design_full.TreatmentRAS,
+                                   levels = design_limma_full)
+fit_limma_Q_vs_RAS     <- contrasts.fit(fit_limma_full, contrast_Q_vs_RAS)
+fit_limma_Q_vs_RAS_2   <- eBayes(fit_limma_Q_vs_RAS, robust = TRUE)
+sig_limma_Q_vs_RAS_all <- topTable(fit_limma_Q_vs_RAS_2, adjust="BH", number = Inf)
+
+##--> Genes DE through time, whatever the treatment
+fit_limma_time_2 <- eBayes(fit_limma_time, robust = TRUE)
+sig_limma_time <- topTable(fit_limma_time_2, coef=c(3:5), adjust="BH", number = Inf)
+
+
+##--> Genes that are not DE between treatment
+not_DE_Q_vs_RAS <- setdiff(rownames(data_rma),
+                           rownames(sig_limma_Q_vs_RAS_all[which(sig_limma_Q_vs_RAS_all$P.Value<=.2),]))
+
+##--> Gene that are consistenly DE through time among cell types 
+DE_Q_vs_RAS_concoord <-  sig_limma_time[match(not_DE_Q_vs_RAS, row.names(sig_limma_time), nomatch = 0),]
+DE_Q_vs_RAS_concoord  <- DE_Q_vs_RAS_concoord[order(DE_Q_vs_RAS_concoord$adj.P.Val),]
+DE_Q_vs_RAS_concoord  <- DE_Q_vs_RAS_concoord[which(DE_Q_vs_RAS_concoord$adj.P.Val < .005), ]
+
+```
+
+## Annotation
+
+```{r}
+##--> Compute the average expression between replicates
+average_transcriptomic_data <- data_rma_no_batch
+average_transcriptomic_data <- cbind(t(apply(average_transcriptomic_data[,c(1:12)], 1,
+                                       function(x){a <- x[1:6]; b <- x[7:12]; rowMeans(data.frame(a,b))})),
+                                     t(apply(average_transcriptomic_data[,c(13:24)], 1,
+                                       function(x){a <- x[1:6]; b <- x[7:12]; rowMeans(data.frame(a, b))})))
+
+##--> Annotation 
+sig_limma_RAS$Gene_Symbol <- annotation_bioconductor[match(row.names(sig_limma_RAS),
+                                                      annotation_bioconductor[,1]),]$HGNC_Symbol
+sig_limma_time$Gene_Symbol <- annotation_bioconductor[match(row.names(sig_limma_time),
+                                                      annotation_bioconductor[,1]),]$HGNC_Symbol
+sig_limma_Q_vs_RAS_all$Gene_Symbol <- annotation_bioconductor[match(row.names(sig_limma_Q_vs_RAS_all),
+                                                       annotation_bioconductor[,1]),]$HGNC_Symbol
+DE_Q_vs_RAS_concoord$Gene_Symbol <- annotation_bioconductor[match(row.names(DE_Q_vs_RAS_concoord),
+                                                        annotation_bioconductor[,1]),]$HGNC_Symbol
+
+```
+
+## Volcano plot
+
+```{r, fig.cap= "Differential analysis for RAS time-courses: volcano plot", message = FALSE, warning = FALSE, echo = TRUE, fig.height= 10}
+##--> Create a function to compute the max absolute logFC
+get_max_absolut_FC <- function (x) {
+  fc <- x[1:6] - x[1]
+  max_fc <- max(fc)
+  min_fc <- min(fc)
+  if (abs(max_fc) > abs(min_fc)) {abs_fc <- max_fc}
+  if (abs(max_fc) < abs(min_fc)) {abs_fc <- min_fc}
+  return(abs_fc)
+}
+
+##--> Select expression matrix for DE whatever treatment
+average_transcriptomic_data_RAS <- data.frame(average_transcriptomic_data[,c(7:12)])
+
+##--> Compute the max absolute logFC for each treatment
+average_transcriptomic_data_RAS$Max_LFC_RAS <- as.numeric(apply(average_transcriptomic_data_RAS[,c(1:6)],
+                                                                1, get_max_absolut_FC))
+
+##--> Add the pval and the qval
+average_transcriptomic_data_RAS$Pval <- sig_limma_RAS_all[match(row.names(average_transcriptomic_data_RAS),
+                                         row.names(sig_limma_RAS_all)),8]
+average_transcriptomic_data_RAS$Qval <- sig_limma_RAS_all[match(row.names(average_transcriptomic_data_RAS),
+                                         row.names(sig_limma_RAS_all)),9]
+
+##--> Annotation
+average_transcriptomic_data_RAS$Gene_Symbol <- annotation_bioconductor[match(
+  row.names(average_transcriptomic_data_RAS),
+  annotation_bioconductor[,1]), ]$HGNC_Symbol
+
+##--> Format the data
+volcano_data <- average_transcriptomic_data_RAS
+volcano_data$Change <- "STABLE"
+volcano_data$Change[which(volcano_data$Qval < .005 
+                    & volcano_data$Max_LFC_RAS 
+                    > .48)] <- "UP"
+volcano_data$Change[which(volcano_data$Qval < .005 
+                    & volcano_data$Max_LFC_RAS 
+                    < - .48)] <- "DOWN"
+
+volcano_data <- volcano_data[order(volcano_data$Qval),]
+
+xlim <- c(-6, -4)
+ylim <- c(6, NA)
+
+##--> Volcano plot
+ggplot(data = volcano_data, aes(y = -log10(Qval), x = Max_LFC_RAS)) +
+  geom_point(aes(color = Change)) +
+  geom_text_repel(data = subset(volcano_data, Change == "DOWN")[c(1:20),],
+                    aes(label = Gene_Symbol),
+                    segment.color = "black", size = 3,  force = 1, nudge_x = -0.25) +
+  geom_text_repel(data = subset(volcano_data, Change == "UP")[c(1:20),],
+                    aes(label = Gene_Symbol),
+                    segment.color = "black", size = 3,  force = 1, nudge_x = 0.25) +
+  geom_hline(yintercept = -log10(.005)) +
+  geom_vline(xintercept = c(-.48,.48)) +
+  scale_x_continuous(limits = c(-7, 7), name = "Max Abs Log2 FC") +
+  scale_y_continuous(name = "-log10 Qval", limits = c(0,7)) +
+  geom_point(data = volcano_data[which(volcano_data$Change == "CONSISTENT"),],
+             aes(y = -log10(Qval), x = Max_LFC_RAS), color = "grey50") +
+  scale_color_manual(values=c("chartreuse3", "grey", "firebrick1")) +
+  theme_classic() + theme(legend.position="none")
+```
+
+## Plot the expression trajectories for some probes
+
+### Top 10 DE genes during RAS timecourse
+
+```{r,fig.cap= "Top DE genes during RAS timecourse", fig.height= 10}
+##--> Format the data 
+sig_limma_RAS_select <- sig_limma_RAS[-which(is.na(sig_limma_RAS$Gene_Symbol) | sig_limma_RAS$Gene_Symbol == ""),][c(1:10),]
+
+data_plot_RAS <- data_rma_no_batch[match(row.names(sig_limma_RAS_select), row.names(data_rma_no_batch)),]
+data_plot_RAS <- data.frame(Treatment = c(rep("Q", 120), rep("RAS", 120)),
+                            Time = rep(rep(seq(from = 0, to = 5), each = 10), 2),
+                            Batch = c(rep(c(1,2), each = 60), rep(c(3,4), each = 60)),
+                            Exprs = c(data_plot_RAS),
+                            Gene = rep(sig_limma_RAS_select$Gene_Symbol, 24))
+
+##--> Plot
+ggplot(data = data_plot_RAS, col = Treatment) +
+  geom_smooth(aes(x=Time, y = Exprs, group = Treatment, col = Treatment)) +
+  facet_wrap(~Gene) +
+  ggtitle(" Top 10 DE genes during RAS timecourse")
+```
+
+### Top DE genes through time
+
+```{r,fig.cap= "Top DE genes through time, whatever the treatment", fig.height= 10}
+##--> Format the data 
+sig_limma_time_select <- sig_limma_time[-which(is.na(sig_limma_time$Gene_Symbol) | sig_limma_time$Gene_Symbol == ""),][c(1:10),]
+
+data_plot_time <- data_rma_no_batch[match(row.names(sig_limma_time_select), row.names(data_rma_no_batch)),]
+data_plot_time <- data.frame(Treatment = c(rep("Q", 120), rep("RAS", 120)),
+                            Time = rep(rep(seq(from = 0, to = 5), each = 10), 2),
+                            Batch = c(rep(c(1,2), each = 60), rep(c(3,4), each = 60)),
+                            Exprs = c(data_plot_time),
+                            Gene = rep(sig_limma_time_select$Gene_Symbol, 24))
+
+##--> Plot
+ggplot(data = data_plot_time, col = Treatment) +
+  geom_smooth(aes(x=Time, y = Exprs, group = Treatment, col = Treatment)) +
+  facet_wrap(~Gene) +
+  ggtitle(" Top 10 DE through time, whatever the treatment")
+```
+
+### Top DE genes between Q and RAS
+
+```{r,fig.cap= "Top DE genes between Q and RAS at any time point", fig.height= 10}
+##--> Format the data 
+sig_limma_Q_vs_RAS_select <- sig_limma_Q_vs_RAS_all[-which(is.na(sig_limma_Q_vs_RAS_all$Gene_Symbol) | sig_limma_Q_vs_RAS_all$Gene_Symbol == ""),][c(1:10),]
+
+data_plot_Q_vs_RAS <- data_rma_no_batch[match(row.names(sig_limma_Q_vs_RAS_select), row.names(data_rma_no_batch)),]
+data_plot_Q_vs_RAS <- data.frame(Treatment = c(rep("Q", 120), rep("RAS", 120)),
+                            Time = rep(rep(seq(from = 0, to = 5), each = 10), 2),
+                            Batch = c(rep(c(1,2), each = 60), rep(c(3,4), each = 60)),
+                            Exprs = c(data_plot_Q_vs_RAS),
+                            Gene = rep(sig_limma_Q_vs_RAS_select$Gene_Symbol, 24))
+
+##--> Plot
+ggplot(data = data_plot_Q_vs_RAS, col = Treatment) +
+  geom_smooth(aes(x=Time, y = Exprs, group = Treatment, col = Treatment)) +
+  facet_wrap(~Gene) +
+  ggtitle("Top 10 DE between Q and RAS at any time point")
+```
+
+### Top concordant genes betwen Q and RAS
+
+```{r, fig.cap= "Top concordant genes betwen Q and RAS", fig.height= 10}
+##--> Format the data 
+DE_Q_vs_RAS_concoord_select <- DE_Q_vs_RAS_concoord[-which(is.na(DE_Q_vs_RAS_concoord$Gene_Symbol) | DE_Q_vs_RAS_concoord$Gene_Symbol == ""),][c(1:10),]
+
+data_plot_concoord <- data_rma_no_batch[match(row.names(DE_Q_vs_RAS_concoord_select), row.names(data_rma_no_batch)),]
+data_plot_concoord  <- data.frame(Treatment = c(rep("Q", 120), rep("RAS", 120)),
+                            Time = rep(rep(seq(from = 0, to = 5), each = 10), 2),
+                            Batch = c(rep(c(1,2), each = 60), rep(c(3,4), each = 60)),
+                            Exprs = c(data_plot_concoord ),
+                            Gene = rep(DE_Q_vs_RAS_concoord_select$Gene_Symbol, 24))
+
+##--> Plot
+ggplot(data = data_plot_concoord, col = Treatment) +
+  geom_smooth(aes(x=Time, y = Exprs, group = Treatment, col = Treatment)) +
+  facet_wrap(~Gene) +
+  ggtitle("Top 10 DE concordant genes betwen Q and RAS")
+```
+
+## Heatmap
+
+```{r, fig.cap= "Gene expression profile during RAS OIS - K-means clustering", fig.height= 10}
+##--> Compute Z-score (Mean expression = 0 and SD = 1 for each gene)
+Z_score_transcriptomic_data <- average_transcriptomic_data
+Z_score_transcriptomic_data  <- Z_score_transcriptomic_data [match(row.names(sig_limma_RAS), row.names(Z_score_transcriptomic_data )),]
+Z_score_transcriptomic_data  <- unique(Z_score_transcriptomic_data )
+
+center_rowmeans <- function(x) {
+    mean_x = rowMeans(x)
+    sd_x = sd(x)
+    (x - mean_x) / sd_x 
+}
+
+data_transcriptomic_HM <- cbind(center_rowmeans(Z_score_transcriptomic_data[,c(1:6)]),
+                                center_rowmeans(Z_score_transcriptomic_data[,c(7:12)]))
+
+##--> Hierarchical clustering
+clustering_hc <-  hclust(as.dist(1-cor(t(data_transcriptomic_HM[,c(7:12)]))), method = "ward.D2")
+clusters <- cutree(tree = clustering_hc , k = 10)
+
+##--> Heatmap meta-information
+library(RColorBrewer)
+library(pheatmap)
+
+annotation_HM <- data.frame(Var = as.factor(clusters))
+rownames(annotation_HM) <- row.names(data_transcriptomic_HM)
+var <- c(brewer.pal(10, name = "Set3"))
+names(var) <- as.character(seq(1,10,1))
+anno_colors <- list(var = var)  
+data_transcriptomic_RAS_HM <- data_transcriptomic_HM[clustering_hc$order,c(7:12)]
+
+##--> Heatmap
+heatmap <- pheatmap(data_transcriptomic_RAS_HM,
+         show_rownames = FALSE,
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         scale = 'row',
+         annotation_row = annotation_HM,
+         annotation_colors = anno_colors,
+         color = colorRampPalette(c("blue", "black", "gold"))(100))
+```
+
+# Clustering with WGCNA
+
+Probes constitutive of the RAS OIS specific transcriptomic signature were clustered using the weighted gene correlated network analysis approach implemented in the WGCNA R package. Standard WGCNA parameters were used for the analysis, with the exceptions of soft-thresholding power which was defined using methods described by (Langfelder et al., 2008) and set at 18. The 7 co-expressed probe clusters identified were further functionally characterized using gene set over-representation tests. The same approach as previously described for the SOM-defined clusters was used.
+
+## Inputs and parameters
+
+### Prepare inputs 
+
+```{r}
+# Load the library WGCNA
+library("WGCNA")
+
+# Select and transpose the data
+data_WGCNA <- volcano_data[which(volcano_data$Change != "STABLE"),]
+data_WGCNA <- t(data_rma_no_batch[match(row.names(data_WGCNA), row.names(data_rma_no_batch)),-c(1:12)])
+row.names(data_WGCNA) <- c(paste(c(0,1,2,3,4,6), "_1", sep = ""), paste(c(0,1,2,3,4,6), "_2", sep = ""))
+
+# Create a time matrix
+time <- data.frame(D0 = rep(c(1,0,0,0,0,0), 2),
+                   D1 = rep(c(0,1,0,0,0,0), 2),
+                   D2 = rep(c(0,0,1,0,0,0), 2),
+                   D3 = rep(c(0,0,0,1,0,0), 2),
+                   D4 = rep(c(0,0,0,0,1,0), 2),
+                   D6 = rep(c(0,0,0,0,0,1), 2))
+row.names(time) <- row.names(data_WGCNA)
+```
+
+### Initial sample clustering
+
+```{r, fig.cap= "WGCNA - Initial sample clustering"}
+# Clustering samples based on the subset of genes selected for WGCNA analysis
+tree <- hclust(dist(data_WGCNA), method = "average")
+colors <- numbers2colors(time, signed= FALSE)
+plotDendroAndColors(tree, colors, groupLabels= names(time),
+                    main="Sample Dendrogram and Trait heatmap")
+```
+
+### Define soft-thresholding powers
+
+```{r, fig.cap= "WGCNA - Scale independance and mean connectivity"}
+# Choose a set of soft-thresholding powers
+powers <- seq(from = 1, to=100, by=1)
+
+# Call the network topology analysis function
+sft <- pickSoftThreshold(data_WGCNA,
+                         powerVector = powers,
+                         verbose = 5,
+                         networkType = "signed",
+                         corFnc = bicor)
+
+P1 <- ggplot(sft$fitIndices, aes(x=Power, y = -sign(slope)*SFT.R.sq, label = Power)) +
+        geom_text() + geom_hline(yintercept = .8, color = "red") + 
+        ggtitle("Scale independence") +
+        ylab("Scale Free Topology Model Fit,signed R^2") +
+        xlab("Soft Threshold (power)")
+
+P2 <- ggplot(sft$fitIndices, aes(x=Power, y = mean.k. , label = Power)) +
+        geom_text() + geom_hline(yintercept = .8, color = "red") + 
+        ggtitle("Mean connectivity") +
+        ylab("Mean Connectivity") +
+        xlab("Soft Threshold (power)")
+
+#--->  Combining the two plots
+grid.arrange(P1 , P2, nrow = 1)
+```
+
+### Clustering
+
+```{r, fig.cap= "WGCNA - Clusterizing genes based on TOM"}
+#---> Turn on multi-threading
+enableWGCNAThreads()
+
+#---> Create the adjacency and the TOM matrices
+soft_power <- 18
+adjacency <- adjacency(data_WGCNA,
+                      power = soft_power,
+                      type = "signed",
+                      corFnc = "bicor")
+
+# Translate the adjacency into topological overlap matrix 
+tom <- TOMsimilarity(adjacency, TOMType = "signed")
+
+# Calculate the corresponding dissimilarity
+diss_tom <- 1-tom                                     
+
+#---> Clusterizing genes based on TOM
+gene_tree <- hclust(as.dist(diss_tom), method="average")
+plot(gene_tree,
+     xlab = "",
+     sub = "",
+     main = "Gene Clustering on TOM-based dissimilarity",
+     labels= FALSE,
+     hang = 0.04)
+```
+
+### Defining gene modules
+
+```{r, fig.cap= "WGCNA - Initial set of eigengenes", fig.height= 12}
+#---> Define the cutoff for gene module size
+min_module_size <- 200 
+
+#---> Cut the clustering tree
+dynamic_mods <- cutreeDynamic(dendro = gene_tree,
+                            distM = diss_tom,
+                            deepSplit = 3,
+                            pamRespectsDendro = FALSE,
+                            minClusterSize = min_module_size)
+
+dynamic_colors <- labels2colors(dynamic_mods)
+
+#---> Clustering eigengenes
+library(ggdendro)
+ME_list <- moduleEigengenes(data_WGCNA, color = dynamic_colors, softPower = soft_power)
+ME <- ME_list$eigengenes
+ME_diss <- 1 - cor(ME)
+ME_tree <- as.dendrogram(hclust(as.dist(ME_diss), method= "average"))
+
+P1 <- ggdendrogram(ME_tree) + 
+  ggtitle("Clustering of module eigengenes")
+
+#---> Heat map for this set of clusters
+data_transcriptomic_WGCNA_module_RAS <- t(data_WGCNA)[order(ME_list$validColors),]
+annot_WGCNA_module_RAS <- data.frame(Module = ME_list$validColors[(order(ME_list$validColors))])
+row.names(annot_WGCNA_module_RAS) <- row.names(data_transcriptomic_WGCNA_module_RAS)
+
+color <- as.character(unique(annot_WGCNA_module_RAS[,1]))
+names(color) <- as.character(unique(annot_WGCNA_module_RAS[,1]))
+color <- list(Module = color)
+
+P2 <- pheatmap(cbind(data_transcriptomic_WGCNA_module_RAS[,c(7:12)],
+                     data_transcriptomic_WGCNA_module_RAS[,c(1:6)]),
+               cluster_rows = FALSE,
+               cluster_cols = FALSE,
+               scale = "row",
+               show_rownames = FALSE,
+               color = colorRampPalette(c("blue", "black", "gold"))(100),
+               annotation_row = annot_WGCNA_module_RAS,
+               annotation_colors = color, silent = TRUE,
+               main = "Expression in module eigengenes")
+
+#---> Combine the two plots
+do.call(grid.arrange,list(P1,P2[[4]]))
+```
+
+### Refining gene modules
+
+```{r, fig.cap= "WGCNA - Comparison of eigengenes before / after merging"}
+#---> Merge modules that are close to each other
+ME_diss_thres <- 0.1
+
+merge <- mergeCloseModules(data_WGCNA,
+                           dynamic_colors,
+                           MEs = ME,
+                           cutHeight = ME_diss_thres,
+                           verbose = 3,
+                           iterate = TRUE,
+                           useAbs = FALSE)
+
+#---> Compare eigengenes
+merged_colors <- merge$colors
+merged_ME <- merge$newMEs
+
+plotDendroAndColors(gene_tree, cbind(dynamic_colors, merged_colors),
+                    c("Dynamic Tree Cut", "Merged dynamic"), dendroLabels= FALSE,
+                    hang=0.03, addGuide= TRUE, guideHang=0.05)
+```
+
+```{r, fig.cap= "WGCNA - Final set of eigengenes", fig.height= 12}
+#---> Clustering eigengenes
+module_colors <- merged_colors
+color_order <- c("grey", standardColors(50))
+module_labels <- match(module_colors, color_order )-1
+ME <- merged_ME
+ME_diss_merged <- 1 - cor(ME)
+ME_tree <- hclust(as.dist(ME_diss_merged), method= "average")
+
+P1 <- ggdendrogram(ME_tree) + 
+  ggtitle("Clustering of module eigengenes")
+
+#---> Heat map for the final set of clusters
+data_transcriptomic_WGCNA_module_RAS <- t(data_WGCNA)[order(module_colors),]
+data_transcriptomic_WGCNA_module_RAS <- data.frame(data_transcriptomic_WGCNA_module_RAS,
+                                                  Modules = as.factor(as.character(
+                                                    module_colors[order(module_colors)])))
+
+order <- as.factor(c("magenta", "purple", "pink", "yellow","blue",
+                     "greenyellow", "black", "green", "brown"))
+
+data_transcriptomic_WGCNA_module_RAS$Modules <-as.character(
+                    data_transcriptomic_WGCNA_module_RAS$Modules)
+data_transcriptomic_WGCNA_module_RAS[which(data_transcriptomic_WGCNA_module_RAS$
+                                             Modules =="purple"),]$Modules <- "magenta"
+data_transcriptomic_WGCNA_module_RAS <- data_transcriptomic_WGCNA_module_RAS[
+                    order(match(data_transcriptomic_WGCNA_module_RAS$Modules,order)),]
+data_transcriptomic_WGCNA_module_RAS <- data_transcriptomic_WGCNA_module_RAS[
+                    -which(data_transcriptomic_WGCNA_module_RAS$Modules == "greenyellow"),]
+
+color <- as.character(unique(data_transcriptomic_WGCNA_module_RAS$Modules))
+names(color) <- as.character(unique(data_transcriptomic_WGCNA_module_RAS$Modules))
+color <- list(Module = color)
+annot <- data.frame(Module = data_transcriptomic_WGCNA_module_RAS$Modules)
+row.names(annot) <- row.names(data_transcriptomic_WGCNA_module_RAS)
+
+P2 <- pheatmap(cbind(data_transcriptomic_WGCNA_module_RAS[,c(7:12)],
+                     data_transcriptomic_WGCNA_module_RAS[,c(1:6)]),
+               cluster_rows = FALSE,
+               cluster_cols = FALSE,
+               scale = "row",
+               show_rownames = FALSE,
+               color = colorRampPalette(c("blue", "black", "gold"))(100),
+               annotation_row = annot,
+               annotation_colors = color, silent = TRUE,
+               main = "Expression in module eigengenes")
+
+#---> Combine the two plots
+do.call(grid.arrange,list(P1,P2[[4]]))
+```
+
+## Relationship between time and modules
+
+```{r, fig.cap= "WGCNA - Relationship between time and eigengenes"}
+#---> Define number of genes and samples
+n_genes <- ncol(data_transcriptomic_WGCNA_module_RAS)
+n_samples <- nrow(data_transcriptomic_WGCNA_module_RAS)
+
+#---> Recalculate MEs with color labels
+ME_0 <- moduleEigengenes(data_WGCNA, module_colors)$eigengenes
+ME   <- orderMEs(ME_0)
+colnames(ME) <- gsub("ME", "", colnames(ME))
+ME <- ME[,order(match(colnames(ME), order))]
+module_trait_cor <- cor(ME, time, use= "p")
+module_trait_pvalue <-  corPvalueStudent(module_trait_cor, n_samples)
+
+#---> Plot correlation matrix
+text_matrix <- paste(signif(module_trait_cor, 2), "\n(",
+                     signif(module_trait_pvalue, 1), ")", sep= "")
+
+dim(text_matrix) <- dim(text_matrix)
+
+par(mar= c(6, 8.5, 6, 6))
+    
+#---> Display the corelation values with a heatmap plot
+cor <- labeledHeatmap(Matrix= module_trait_cor,
+               xLabels= names(time),
+               yLabels= names(ME),
+               ySymbols= names(ME),
+               colorLabels= FALSE,
+               colors= blueWhiteRed(50),
+               textMatrix= text_matrix ,
+               setStdMargins= FALSE,
+               cex.text= 0.5,
+               zlim= c(-1,1),
+               main= paste("Module-trait relationships"))
+```
+
+## Functional over-representation analysis 
+
+```{r, fig.cap= "WGCNA - Functional over-representation analysis (MSigDB hallmark)", fig.height= 8}
+#---> Match probes in the data set to the probe IDs in the annotation file
+probes <- row.names(data_rma_no_batch)
+probes2annot <- match(probes, annotation_bioconductor[,1])
+
+#---> Get the corresponding Entrez_ID
+all_IDs <- annotation_bioconductor$Entrez_ID[probes2annot]
+
+#---> Construct the input data set
+fun_enrich_WGCNA <- data.frame(t(data_WGCNA))
+fun_enrich_WGCNA$Entrez <- as.character(annotation_bioconductor[match(row.names(fun_enrich_WGCNA),
+                                                           annotation_bioconductor[,1]),]$Entrez_ID)
+fun_enrich_WGCNA$Symbol <- as.character(annotation_bioconductor[match(row.names(fun_enrich_WGCNA),
+                                                            annotation_bioconductor[,1]),]$HGNC_Symbol)
+fun_enrich_WGCNA <- merge(fun_enrich_WGCNA, annot, by = "row.names")
+fun_enrich_WGCNA <- fun_enrich_WGCNA[-which(is.na(fun_enrich_WGCNA$Entrez)),c(14:16)]
+fun_enrich_WGCNA <- split(fun_enrich_WGCNA[,1], list(fun_enrich_WGCNA$Module))
+fun_enrich_WGCNA <- fun_enrich_WGCNA[order(match(names(fun_enrich_WGCNA),unique(annot$Module)))]
+
+#--->  Over-representation analysis (MSigDB Hallmark)
+library(ReactomePA)
+library(clusterProfiler)
+
+# Load the gmt file
+GMT <- read.gmt("./tools/h.all.v6.0.entrez.gmt")
+
+# Run the over-representation analysis 
+fun_enrich_res <- data.frame(compareCluster(fun_enrich_WGCNA, fun='enricher',
+                                            TERM2GENE=GMT, pvalueCutoff=1, qvalueCutoff = 1,
+                                            minGSSize = 10))
+# Filter the data
+fun_enrich_res_2 <- data.frame()
+for (i in unique(fun_enrich_res$Cluster)) {
+  x <- fun_enrich_res[which(fun_enrich_res$Cluster == i),]
+  x[which(x$qvalue > .2),]$qvalue <- NA
+  x <- x[order(x$qvalue),]
+  fun_enrich_res_2 <- rbind(fun_enrich_res_2, x)
+}
+
+fun_enrich_res_2 <- na.omit(fun_enrich_res_2)
+
+# Clustering
+library(reshape)
+fun_enrich_res_tmp <- fun_enrich_res_2[,c("ID", "qvalue", "Cluster")]
+fun_enrich_res_tmp <- cast(fun_enrich_res_tmp, Cluster~ID, value = "qvalue")
+fun_enrich_res_tmp <- data.matrix(fun_enrich_res_tmp)
+fun_enrich_res_tmp[is.na(fun_enrich_res_tmp)] <- 0
+row.names(fun_enrich_res_tmp) <- fun_enrich_res_tmp[,1]
+fun_enrich_res_tmp <- fun_enrich_res_tmp[,-1]
+order_fun_enrich <- hclust(as.dist(1-cor(fun_enrich_res_tmp)), method = "ward.D2")$order
+
+fun_enrich_res_2$Description <- factor(fun_enrich_res_2$Description,
+                                       levels =colnames(fun_enrich_res_tmp)[order_fun_enrich] )
+fun_enrich_res_2$Cluster <- factor(fun_enrich_res_2$Cluster, levels=unique(annot$Module))
+fun_enrich_res_2$Percent <- unlist(lapply(strsplit(fun_enrich_res_2$GeneRatio, "/"), function(x){as.numeric(x[1])/as.numeric(x[2])}*100))
+
+# Plot
+ggplot(fun_enrich_res_2, aes(y = Description, x = Cluster, fill = -log10(pvalue), size = Percent)) +
+  geom_point(shape = 21, stroke = .5) +
+  scale_fill_gradient(low = "firebrick1", high = "chartreuse3") +
+  theme_classic() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1), axis.text.y = element_text(size = 8))
+
+```
+
+# Export results
+
+## Export results as table
+
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+output <- volcano_data
+output <- merge(output, annot, by = "row.names", all.x = TRUE)
+
+write.table(output, "./results/TIMECOURSE_RAS_Q_LIMMA_WGCNA.txt", sep = "\t",
+            quote = F, row.names = F, col.names = TRUE)
+```
+
+## Export results as a hg19 .bed file
+
+```{r}
+library(rtracklayer)
+library(R.utils)
+library(GenomicRanges)
+
+output_gr <- merge(output, annotation_bioconductor, by.x = "Row.names", by.y = "Probe_ID", all.x = TRUE)
+output_gr$RGB_BED <- "0,0,0"
+output_gr$RGB_BED[which(output_gr$Change == "UP")] <- "255,255,0"
+output_gr$RGB_BED[which(output_gr$Change == "DOWN")]  <- "0,0,255"
+
+output_gr <- data.frame(seqnames = output_gr$Chromosome,
+                          start = output_gr$Start,
+                          end = output_gr$Stop,
+                          name = output_gr$HGNC_Symbol,
+                          score = output_gr$Max_LFC_RAS,
+                          strand = rep("*", nrow(output_gr)),
+                          start2 = output_gr$Start,
+                          end2 = output_gr$Stop,
+                          RGB = output_gr$RGB_BED)
+
+output_gr <- output_gr[-which(is.na(output_gr$seqnames) |
+                              is.na(output_gr$start) |
+                              is.na(output_gr$end)),]
+output_gr <- GRanges(output_gr)
+seqlevels(output_gr) <-paste("chr", seqlevels(output_gr), sep = "")
+
+chain <- "http://hgdownload.cse.ucsc.edu/goldenpath/hg38/liftOver/hg38ToHg19.over.chain.gz"
+download.file(chain, destfile = "./tools/hg38ToHg19.over.chain.gz")
+gunzip("./tools/hg38ToHg19.over.chain.gz", "./tools/hg38ToHg19.over.chain", overwrite = TRUE)
+chain <- import.chain("./tools/hg38ToHg19.over.chain")
+
+output_gr_hg19 <- unlist(liftOver(output_gr, chain))
+output_gr_hg19 <- data.frame(output_gr_hg19)
+output_gr_hg19 <-output_gr_hg19[,c("seqnames", "start", "end","name",
+                                   "score", "strand", "start2", "end2", "RGB")]
+write.table(output_gr_hg19,
+            "./results/TIMECOURSE_RAS_Q_LIMMA_WGCNA_HG19.bed",
+            quote = F,
+            col.names = F,
+            row.names = F,
+            sep = "\t")
+```
+
+# Session Info
+```{r, eval = TRUE, results = 'markup', message = TRUE, echo = TRUE,}
+sessionInfo()
+```

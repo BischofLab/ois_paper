@@ -1,0 +1,2751 @@
+---
+title: "Integrative multiomic profiling reveals epigenetic precoding, transcription factor hierarchies and reprogrammability of the senescent state"
+subtitle: "Appendix B : Analyses of histone modification ChIP-seq data"
+date: ""
+
+output:
+   BiocStyle::html_document:
+    theme: cosmo
+    highlight:  "tango"
+    toc: true
+    toc_float:
+      toc_collapsed: true
+    toc_depth: 2
+    number_sections: true
+    code_folding: 'show'
+    df_print: paged
+abstract: |
+        
+vignette: |
+  %\VignetteIndexEntry{Authoring R Markdown vignettes}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+\pagebreak
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE, eval = TRUE, results = "hide", message = FALSE, warning = FALSE, echo = TRUE, fig.wide = TRUE,  fig.align='center')
+```
+
+# Overview of the data
+
+The table below summarize the information relative to the histone modification ChIP-seq data anlyzed in the scope of this study. The information given are :
+
+* *Time point* : T0 - before induction of RAS , 72h after induction or 144h induction),
+* *Type* : type of the library (input, H3K4me1, H3K4me3, H3K27ac or H3K27me3),
+* *Replicate* : there are two replciates per codition,
+* *SRA* : Sequence Read Archive accession number,
+* *Raw reads* : total number of reads for each library before any processing,
+* *Clean reads* : number of reads remaining after quality filtering and adapter triming,
+* *Uniquely mapped* : number of unambiguously mapped reads,
+* *Non duplicated* : number of reads after filter for PCR / optical duplicates,
+* *Not in BLR* : number of reads mapped outside hg19 ENCODE blacklisted regions (BLR),
+* *% kept* : percentage of reads kept for subsequent analysis after filtering,
+* *% duplicates* : percentage of PCR / optical duplicates,
+* *% BLR* : percentage of reads mapped in BLR.
+
+```{r, results= "asis", echo = FALSE}
+library(dplyr)
+library(knitr)
+library(kableExtra)
+info_chipseq <- read.table("./data/ChIP-seq/ChIP-seq_HISTONE_data_info.txt", header = TRUE)
+
+kable(info_chipseq, ,
+              col.names = c("Time point", "Type", "Replicate", "SRA",
+                             "Raw reads (N)", "Clean reads (N)", "Uniquely mapped (N)",
+                              "Non duplicated (N)", "Not in BLR (N)", "% kept",
+                              "% duplicates", "% in BLR")) %>%
+kable_styling("striped", full_width = TRUE, font_size = 9, position = "left") %>%
+  collapse_rows(columns = 1:2, valign = "top")
+
+```
+
+# Preprocessing of histone ChIP-seq
+
+All the histone ChIP-seq data were processed using a workflow written in *bash* and ran on a Unix cluster driven by Sun Gride Engine. The different steps we described bellow are :
+
+* quality check on raw reads with [fastQC 0.11.5](https://www.bioinformatics.babraham.ac.uk/projects/fastqc/),
+* read trimming and cleaning with [fastq-mcf 1.04.803](https://github.com/ExpressionAnalysis/ea-utils/tree/wiki),
+* check for contaminations with [fastq-screen 0.4.4](https://www.bioinformatics.babraham.ac.uk/projects/fastq_screen/),
+* alignment with [bowtie 1.1.1](http://bowtie-bio.sourceforge.net/index.shtml),
+* de-duplication with [PicardTools 1.130](https://broadinstitute.github.io/picard/),
+* filtering of reads aligned in [Encode blaclisted regions](https://sites.google.com/site/anshulkundaje/projects/blacklists) with [bedtools 2.19.1](http://bedtools.readthedocs.io/en/latest/),
+* sorting and filtering of alignments with [samtools 1.6](http://samtools.sourceforge.net),
+* cross-correlation computation with [spp](https://github.com/kundajelab/phantompeakqualtools),
+* peak calling with [MACS 2.1.0](https://github.com/taoliu/MACS),
+* irreproducible discovery rate computation with [idr](https://sites.google.com/site/anshulkundaje/projects/idr),
+* super-enhancer calling with [ROSE](http://younglab.wi.mit.edu/super_enhancer_code.html).
+
+Briefly, in this workflow, reads are cleaned and trimmed using fastq-mcf from the ea-utils suite v1.1.2 to remove adapters, low quality bases and reads, and discard reads shorter than 25 bp after filtering. Reads are then aligned to the human reference genome (hg19) with bowtie v1.1.1using best matches parameters (bowtie -v 2 -m 1 --best --strata). Alignment files are further processed with samtools v1.2 and PicardTools v1.130 to flag PCR and optical duplicates and remove alignments located in Encode blacklisted regions. Fragment size is estimated *in silico* for each library using spp v1.10.1. Enriched regions are identified for each replicate independently with MACS v2.1.0 with non-IPed genomic DNA as a control (macs2 callpeak --nomodel --shiftsize --shift-control --gsize hs -p 1e-1). These relaxed peak lists are then processed through the irreproducible discovery rate (IDR) pipeline to generate an optimal and reproducible set of peaks for each histone modification type and each time point.
+
+## Preparing the working environment 
+
+```{bash,  eval = FALSE}
+##-->  Create main directories
+mkdir ./Data/
+mkdir ./Output/
+mkdir ./Scripts/
+mkdir ./Std_Output/
+
+##-->  Create subdirectories
+mkdir -p ./Data/0-Raw-Fastq/
+mkdir -p ./Data/0-TRIMMED_Fastq/
+mkdir -p ./Data/1-DEDUP_Bam/
+mkdir -p ./Data/1-MAPPING_Bam/
+mkdir -p ./Data/1-NOBLACKLIST_Bam/
+
+mkdir -p ./Output/0-CONTAMINATION/
+mkdir -p ./Output/0-FAST-QC/
+mkdir -p ./Output/2-PHANTOM_QC/
+
+mkdir -p ./Std_Output/0-FastqMCF/
+mkdir -p ./Std_Output/0-FastqScreen/
+mkdir -p ./Std_Output/1-Bowtie/
+mkdir -p ./Std_Output/1-Sort/
+mkdir -p ./Std_Output/1-Dedup/
+mkdir -p ./Std_Output/1-NoBL_Dedup/
+mkdir -p ./Std_Output/2-PhantomQC/
+mkdir -p ./Std_Output/2-HOMERQC/
+mkdir -p ./Std_Output/2-Pearson_Reads/
+```
+
+## QC on row data 
+
+```{bash, eval = FALSE}
+##-->  Run fastQC on all samples 
+for i in $(ls --color=never ./Data/0-Raw-Fastq/)
+do
+    qsub -q ono -cwd -V -l mem_rsvd=8G -b y fastqc ./Data/0-Raw-Fastq/$i
+done
+
+##-->  Move outputs
+mv ./Data/0-Raw-Fastq/*fastqc* ./Output/0-FAST-QC/
+
+```
+
+## Apdapters cleaning, read triming and filtering
+
+```{bash, eval = FALSE}
+##-->  Creation of a batch script
+for i in $(ls --color=never ./Data/0-Raw-Fastq/ | grep "fastq.gz" | sed 's/.fastq.gz//g')
+do
+    echo fastq-mcf                                          `# Version: 1.04.803` \
+        --tempdir ./ -t 0                                   `# Occurance threshold before adapter clipping` \
+        -C 500000                                           `# Number of reads to use for subsampling` \
+        -q 30                                               `# Quality threshold causing base removal` \
+        -l 25                                               `# Minimum remaining sequence length` \
+        -S                                                  `# Save all discarded reads to .skip files` \
+        --qual-mean 30                                      `# Minimum mean quality score` \
+        --max-ns 1                                          `# Maxmium N-calls in a read` \
+        -o  ./Data/0-TRIMMED_Fastq/"$i"_TRIMMED.fastq       `# Output` \
+        ~/save/Outils/Fastq_Contaminants.fasta              `# List of adapters` \
+        ./Data/0-Raw-Fastq/"$i".fastq.gz                    `# Input` \
+    >> ./Scripts/FASTQ-MCF.txt
+done
+
+##-->  Run the analysis
+qarray \
+    -q ono \
+    -cwd \
+    -V \
+    -N FastqMCF \
+    -e ./Std_Output/0-FastqMCF/ \
+    -o ./Std_Output/0-FastqMCF/ \
+    ./Scripts/FASTQ-MCF.txt
+    
+##-->  Run fastqc 
+for i in $(ls --color=never ./Data/0-TRIMMED_Fastq/)
+do
+    qsub -q ono -cwd -V -l mem_rsvd=8G -b y fastqc ./Data/0-TRIMMED_Fastq/$i
+done
+
+mv ./Data/0-TRIMMED_Fastq/*fastqc* ./Output/0-FAST-QC/
+
+```
+
+## Check for contamination
+
+```{bash, eval = FALSE}
+##-->  Creation of batch script
+for i in $(ls --color=never ./Data/0-Raw-Fastq/ | grep "fastq.gz" | sed 's/.fastq.gz//g')
+do
+    rm ./Output/0-CONTAMINATION/"$i"_TRIMMED_screen.txt
+    echo perl ~/bin/Tools/FastqScreen_v0.4.4/fastq_screen      `# Version: 0.4.4` \
+        --subset 1000000                                       `# Number of reads for subsampling` \
+        --outdir ./Output/0-CONTAMINATION/                     `# Output directory` \
+        --aligner bowtie2                                      `# Aligner used (bowtie or bowtie2)` \
+        --threads 1                                            `# Number of threads` \
+       ./Data/0-TRIMMED_Fastq/"$i"_TRIMMED.fastq \
+    >> ./Scripts/FASTQ-SCREEN.txt
+done
+
+##-->  Run the analysis
+qarray \
+    -q ono \
+    -cwd \
+    -V \
+    -N FastqScreen \
+    -e ./Std_Output/0-FastqScreen/ \
+    -o ./Std_Output/0-FastqScreen/ \
+    ./Scripts/FASTQ-SCREEN.txt
+```
+
+## Alignment
+
+```{bash, eval = FALSE}
+##-->  Creation of batch script
+for i in $(ls --color=never ./Data/0-Raw-Fastq/ | grep "fastq.gz$" | sed 's/.fastq.gz$//g')
+do
+    echo "/mount/gensoft2/exe/bowtie/1.1.1/bin/bowtie                                      `# Version: 1.1.1`\
+        -p 8                                                                               `# Number of threads`\
+        -v 2                                                                               `# Number of mismatches between reads and reference allowed`\
+        -m 1                                                                               `# Max number of different alignments allowed for a read`\
+        --best \
+        --strata \
+        -S                                                                                 `# Output format in sam`\
+        /local/databases/index/bowtie/hg19/0.12.7/hg19.fa                                  `# Reference index`\
+        ./Data/0-TRIMMED_Fastq/"$i"_TRIMMED.fastq                                          `# Input`\
+    | samtools view -Sb - > ./Data/1-MAPPING_Bam/"$i".bam"                                 `# Conversion sam to bam with samtools`\
+    >> ./Scripts/BOWTIE.txt
+done
+    
+##-->  Run the analysis        
+qarray \
+    -q ono \
+    -cwd \
+    -V \
+    -pe thread 4 \
+    -N Bowtie \
+    -e ./Std_Output/1-Bowtie/ \
+    -o ./Std_Output/1-Bowtie/ \
+    ./Scripts/BOWTIE.txt
+```
+
+## Sorting
+
+```{bash, eval = FALSE}
+##-->  Creation of batch script
+for IN in $(ls --color=never ./Data/0-Raw-Fastq/ | grep "fastq.gz" | sed 's/.fastq.gz//g')
+do
+    echo samtools sort -@ 8 ./Data/1-MAPPING_Bam/"$IN".bam -o ./Data/1-MAPPING_Bam/"$IN"_SORT.bam -T ./Data/1-MAPPING_Bam/"$IN"  \
+    >> ./Scripts/SAMTOOLS_SORT.txt
+done
+
+
+##-->  Run the analysis        
+qarray \
+    -q ono \
+    -cwd \
+    -V \
+    -pe thread 4 \
+    -N Sort \
+    -e ./Std_Output/1-Sort/ \
+    -o ./Std_Output/1-Sort/ \
+    ./Scripts/SAMTOOLS_SORT.txt
+```
+
+## De-duplication
+
+```{bash, eval = FALSE}
+##----> Mark duplicates with PicardTools
+
+# Creation of batch script
+for i in $(ls --color=never ./Data/0-Raw-Fastq/ | grep "fastq" | sed 's/.fastq//g')
+do
+    echo java -jar ~/bin/Tools/PicardTools_v1.130/picard.jar \
+        MarkDuplicates \
+        REMOVE_DUPLICATES=FALSE \
+        METRICS_FILE=./Data/1-DEDUP_Bam/"$i"_MARKDUP.txt \
+        INPUT=./Data/1-MAPPING_Bam/"$i"_SORT.bam \
+        OUTPUT=./Data/1-DEDUP_Bam/"$i"_MARKDUP.bam \
+    >> ./Scripts/MARKDUP.txt
+done
+
+# Run the analysis        
+qarray \
+    -q ono \
+    -cwd \
+    -V \
+    -N Markdup \
+    -e ./Std_Output/1-Dedup/ \
+    -o ./Std_Output/1-Dedup/ \
+    ./Scripts/MARKDUP.txt
+
+
+##----> Remove duplicates from original .bam
+
+# Creation of batch script
+for i in $(ls --color=never ./Data/0-Raw-Fastq/ | grep "fastq" | sed 's/.fastq//g')
+do
+    echo "samtools view -h -F 0x400 ./Data/1-DEDUP_Bam/"$i"_MARKDUP.bam \
+    | samtools view -hSb - -o ./Data/1-DEDUP_Bam/"$i"_DEDUP.bam" \
+    >> ./Scripts/DEDUP.txt
+done
+
+# Run the analysis
+qarray \
+    -q ono \
+    -cwd \
+    -V \
+    -N Dedup \
+    -e ./Std_Output/1-Dedup/ \
+    -o ./Std_Output/1-Dedup/ \
+    ./Scripts/DEDUP.txt
+```
+
+## Blacklisted regions
+
+```{bash, eval = FALSE}
+##-->  Creation of bathc script
+for i in $(ls --color=never ./Data/0-Raw-Fastq/ | grep "fastq" | sed 's/.fastq//g')
+do
+    echo "intersectBed \
+        -v \
+        -abam ./Data/1-DEDUP_Bam/"$i"_DEDUP.bam \
+        -b ~/save/Outils/consensusBlacklist_hg19.bed \
+        > ./Data/1-NOBLACKLIST_Bam/"$i"_DEDUP_NOBLACKLIST.bam" \
+    >> ./Scripts/NOBLACKLIST_DEDUP.txt
+done
+
+##-->  Run the analysis
+qarray \
+    -q ono \
+    -cwd \
+    -V \
+    -N NoBL_Dedup \
+    -e ./Std_Output/1-NoBL_Dedup/ \
+    -o ./Std_Output/1-NoBL_Dedup/ \
+    ./Scripts/NOBLACKLIST_DEDUP.txt
+```
+
+## Compute cross-correlation
+
+```{bash, eval = FALSE}
+##-->  Creation of batch script
+for i in $(ls --color=never ./Data/0-Raw-Fastq/ | grep "fastq" | sed 's/.fastq//g')
+do
+    echo Rscript ~/bin/Tools/PhantomPeak_QualTools/run_spp_nodups.R \
+        -rf \
+        -c=./Data/1-NOBLACKLIST_Bam/"$i"_DEDUP_NOBLACKLIST.bam \
+        -odir=./Output/2-PHANTOM_QC/ \
+        -savp=./Output/2-PHANTOM_QC/"$i"_PHANTOM.pdf \
+        -out=./Output/2-PHANTOM_QC/"$i"_PHANTOM.txt \
+        -s=-100:5:500 \
+        -x=-500:85 \
+    >> ./Scripts/PHANTOM_QC.txt
+done
+
+##-->  Run the analysis
+qarray \
+    -q ono \
+    -cwd \
+    -V \
+    -N PhantomQC \
+    -e ./Std_Output/2-PhantomQC/ \
+    -o ./Std_Output/2-PhantomQC/ \
+    ./Scripts/PHANTOM_QC.txt
+```    
+
+## Peak calling
+
+### Parameters
+
+```{bash, eval = FALSE}
+marks=(K4Me1 K4Me3 K27Ac K27Me3)
+days=(D0 D3 D6)
+reps=(Rep1 Rep2)
+genomeFile=/local/databases/index/samtools/hg19/0.1.19/hg19.fa
+pvalPeaks=1e-1
+```
+
+### Peak calling on original replicates
+
+```{bash, eval = FALSE}
+
+##--> Merge matched inputs
+
+# Creation of batch script
+echo " \
+samtools merge -f ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST.bam ./Data/1-NOBLACKLIST_Bam/D0Input_Rep1_DEDUP_NOBLACKLIST.bam ./Data/1-NOBLACKLIST_Bam/D0Input_Rep3_DEDUP_NOBLACKLIST.bam
+samtools merge -f ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST.bam ./Data/1-NOBLACKLIST_Bam/D3Input_Rep1_DEDUP_NOBLACKLIST.bam ./Data/1-NOBLACKLIST_Bam/D3Input_Rep3_DEDUP_NOBLACKLIST.bam
+samtools merge -f ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST.bam ./Data/1-NOBLACKLIST_Bam/D6Input_Rep1_DEDUP_NOBLACKLIST.bam ./Data/1-NOBLACKLIST_Bam/D6Input_Rep3_DEDUP_NOBLACKLIST.bam" \
+>> ./Scripts/Merge_Sort_Bam.txt
+
+# Run the analysis
+qarray \
+    -q ono \
+    -cwd \
+    -V \
+    -N Merge_Sort_Bam \
+    -e ./Std_Output/3-Merge_Sort_Bam/ \
+    -o ./Std_Output/3-Merge_Sort_Bam/ \
+    ./Scripts/Merge_Sort_Bam.txt
+
+
+##--> MACS2 peak calling 
+
+mkdir -p ./Data/3-PEAK-CALLING/MACS/Sharp
+
+# Creation of batch script
+echo " \
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D0K4Me1_Rep1_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D0K4Me1_Rep1_MACS2 --nomodel --extsize 70  --gsize hs -p 1e-1 
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D0K4Me1_Rep2_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D0K4Me1_Rep2_MACS2 --nomodel --extsize 108  --gsize hs -p 1e-1
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D3K4Me1_Rep1_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D3K4Me1_Rep1_MACS2 --nomodel --extsize 70  --gsize hs -p 1e-1
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D3K4Me1_Rep2_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D3K4Me1_Rep2_MACS2 --nomodel --extsize 65  --gsize hs -p 1e-1
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D6K4Me1_Rep1_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D6K4Me1_Rep1_MACS2 --nomodel --extsize 80  --gsize hs -p 1e-1 
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D6K4Me1_Rep2_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D6K4Me1_Rep2_MACS2 --nomodel --extsize 113  --gsize hs -p 1e-1 
+
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D0K4Me3_Rep1_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D0K4Me3_Rep1_MACS2 --nomodel --extsize 65  --gsize hs -p 1e-1
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D0K4Me3_Rep2_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D0K4Me3_Rep2_MACS2 --nomodel --extsize 108  --gsize hs -p 1e-1
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D3K4Me3_Rep1_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D3K4Me3_Rep1_MACS2 --nomodel --extsize 75  --gsize hs -p 1e-1
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D3K4Me3_Rep2_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D3K4Me3_Rep2_MACS2 --nomodel --extsize 73  --gsize hs -p 1e-1
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D6K4Me3_Rep1_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D6K4Me3_Rep1_MACS2 --nomodel --extsize 75  --gsize hs -p 1e-1
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D6K4Me3_Rep2_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D6K4Me3_Rep2_MACS2 --nomodel --extsize 110  --gsize hs -p 1e-1
+
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D0K27Ac_Rep1_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D0K27Ac_Rep1_MACS2 --nomodel --extsize 63  --gsize hs -p 1e-1
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D0K27Ac_Rep2_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D0K27Ac_Rep2_MACS2 --nomodel --extsize 70  --gsize hs -p 1e-1
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D3K27Ac_Rep1_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D3K27Ac_Rep1_MACS2 --nomodel --extsize 68  --gsize hs -p 1e-1
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D3K27Ac_Rep2_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D3K27Ac_Rep2_MACS2 --nomodel --extsize 73  --gsize hs -p 1e-1
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D6K27Ac_Rep1_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D6K27Ac_Rep1_MACS2 --nomodel --extsize 65  --gsize hs -p 1e-1
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D6K27Ac_Rep2_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D6K27Ac_Rep2_MACS2 --nomodel --extsize 65  --gsize hs -p 1e-1
+
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D0K27Me3_Rep1_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D0K27Me3_Rep1_MACS2 --nomodel --extsize 80  --gsize hs -p 1e-1
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D0K27Me3_Rep2_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D0K27Me3_Rep2_MACS2 --nomodel --extsize 78  --gsize hs -p 1e-1
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D3K27Me3_Rep1_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D3K27Me3_Rep1_MACS2 --nomodel --extsize 80  --gsize hs -p 1e-1
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D3K27Me3_Rep2_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D3K27Me3_Rep2_MACS2 --nomodel --extsize 88  --gsize hs -p 1e-1
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D6K27Me3_Rep1_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D6K27Me3_Rep1_MACS2 --nomodel --extsize 78  --gsize hs -p 1e-1
+macs2 callpeak callpeak --tempdir ./ -t ./Data/1-NOBLACKLIST_Bam/D6K27Me3_Rep2_DEDUP_NOBLACKLIST.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST.bam --name ./Data/3-PEAK-CALLING/MACS/Sharp/D6K27Me3_Rep2_MACS2 --nomodel --extsize 78  --gsize hs -p 1e-1 " \
+>> ./Scripts/MACS2_Sharp.txt
+
+# Run the analysis
+qarray \
+    -q ono \
+    -cwd \
+    -V \
+    -N MACS2 \
+    -l mem_rsvd=32G \
+    -e ./Std_Output/3-MACS2/ \
+    -o ./Std_Output/3-MACS2/ \
+    ./Scripts/MACS2_Sharp.txt
+```
+
+### Peaks calling on pseudoreplicates of individual replicates
+
+```{bash, eval = FALSE}
+##-->  STEP 1.1 : Count the number of alignments in the each replicated .bam and split them in 2 .bam
+
+# Creation of batch script
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+  for rep in ${reps[@]} ; do
+   if [ ! -f ./Data/1-NOBLACKLIST_Bam/${day}${mark}_${rep}_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ] ; then echo $mark $day $rep
+     
+     echo "\
+     samtools view -h -F 4 -b ./Data/1-NOBLACKLIST_Bam/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST.bam > ./Data/3-IDR/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+     samtools index ./Data/3-IDR/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+     nlines=\$(samtools idxstats ./Data/3-IDR/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST_ONLYMAPPED.bam | awk '{s+=\$3} END {print s}') ; nlines=\$(( (nlines + 1) / 2 )) ;
+     samtools view ./Data/3-IDR/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST_ONLYMAPPED.bam | shuf | split -d -l \${nlines} -  ./Data/3-IDR/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST_ONLYMAPPED ;" \
+     >> ./Scripts/IDR_STEP1.1_${day}${mark}_${rep}.txt
+     
+   fi ;
+  done ;
+ done ;
+done
+
+# Run the analysis
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+  for rep in ${reps[@]} ; do
+    qsub \
+        -q ono \
+        -cwd \
+        -V \
+        -N IDR_Step_1.1 \
+        -e ./Std_Output/3-IDR/ \
+        -o ./Std_Output/3-IDR/ \
+        ./Scripts/IDR_STEP1.1_${day}${mark}_${rep}.txt
+  done ;
+ done ;
+done
+   
+   
+##-->  STEP 1.2 :  Sort and index the 2 PR .bam 
+
+# Creation of batch script
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+  for rep in ${reps[@]} ; do
+    if [ ! -f ./Data/1-NOBLACKLIST_Bam/${mark}_MOUSE_ES_P${rep}.2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam.bai ] ; then echo $mark $day $rep
+     
+     echo "\
+     samtools view -bT $genomeFile ./Data/3-IDR/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST_ONLYMAPPED00 > ./Data/3-IDR/"${day}${mark}_${rep}"_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+     samtools sort -@ 2 ./Data/3-IDR/"${day}${mark}_${rep}"_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ./Data/3-IDR/"${day}${mark}_${rep}"_tmp1 ;
+     mv ./Data/3-IDR/"${day}${mark}_${rep}"_tmp1.bam ./Data/3-IDR/"${day}${mark}_${rep}"_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+     samtools index ./Data/3-IDR/"${day}${mark}_${rep}"_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+     rm ./Data/3-IDR/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST_ONLYMAPPED00
+     
+     samtools view -bT $genomeFile ./Data/3-IDR/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST_ONLYMAPPED01 > ./Data/3-IDR/"${day}${mark}_${rep}"_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+     samtools sort -@ 2 ./Data/3-IDR/"${day}${mark}_${rep}"_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ./Data/3-IDR/"${day}${mark}_${rep}"_tmp2 ;
+     mv ./Data/3-IDR/"${day}${mark}_${rep}"_tmp2.bam ./Data/3-IDR/"${day}${mark}_${rep}"_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+     samtools index ./Data/3-IDR/"${day}${mark}_${rep}"_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+     rm ./Data/3-IDR/"${day}${mark}_${rep}"_DEDUP_NOBLACKLIST_ONLYMAPPED01" \
+     >> ./Scripts/IDR_STEP1.2_${day}${mark}_${rep}.txt
+     
+   fi ;
+  done ;
+ done ;
+done  
+
+# Run the analysis
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+  for rep in ${reps[@]} ; do
+    qsub \
+        -pe thread 2 \
+        -q ono \
+        -cwd \
+        -V \
+        -N IDR_Step_1.2 \
+        -e ./Std_Output/3-IDR/ \
+        -o ./Std_Output/3-IDR/ \
+        ./Scripts/IDR_STEP1.2_${day}${mark}_${rep}.txt
+  done ;
+ done ;
+done
+
+
+##-->  STEP 1.3 :  Peak calling on the two PR
+
+# Creation of batch script
+echo "\
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K4Me1_Rep1_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K4Me1_Rep1_PR1_MACS2 --gsize hs --nomodel --extsize 89  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K4Me1_Rep1_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K4Me1_Rep1_PR2_MACS2 --gsize hs --nomodel --extsize 89  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K4Me1_Rep2_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K4Me1_Rep2_PR1_MACS2 --gsize hs --nomodel --extsize 89  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K4Me1_Rep2_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K4Me1_Rep2_PR2_MACS2 --gsize hs --nomodel --extsize 89  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K4Me3_Rep1_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K4Me3_Rep1_PR1_MACS2 --gsize hs --nomodel --extsize 87  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K4Me3_Rep1_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K4Me3_Rep1_PR2_MACS2 --gsize hs --nomodel --extsize 87  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K4Me3_Rep2_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K4Me3_Rep2_PR1_MACS2 --gsize hs --nomodel --extsize 87  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K4Me3_Rep2_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K4Me3_Rep2_PR2_MACS2 --gsize hs --nomodel --extsize 87  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K27Ac_Rep1_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K27Ac_Rep1_PR1_MACS2 --gsize hs --nomodel --extsize 67  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K27Ac_Rep1_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K27Ac_Rep1_PR2_MACS2 --gsize hs --nomodel --extsize 67  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K27Ac_Rep2_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K27Ac_Rep2_PR1_MACS2 --gsize hs --nomodel --extsize 67  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K27Ac_Rep2_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K27Ac_Rep2_PR2_MACS2 --gsize hs --nomodel --extsize 67  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K27Me3_Rep1_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K27Me3_Rep1_PR1_MACS2 --gsize hs --nomodel --extsize 79  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K27Me3_Rep1_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K27Me3_Rep1_PR2_MACS2 --gsize hs --nomodel --extsize 79  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K27Me3_Rep2_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K27Me3_Rep2_PR1_MACS2 --gsize hs --nomodel --extsize 79  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K27Me3_Rep2_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K27Me3_Rep2_PR2_MACS2 --gsize hs --nomodel --extsize 79  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K4Me1_Rep1_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K4Me1_Rep1_PR1_MACS2 --gsize hs --nomodel --extsize 68  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K4Me1_Rep1_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K4Me1_Rep1_PR2_MACS2 --gsize hs --nomodel --extsize 68  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K4Me1_Rep2_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K4Me1_Rep2_PR1_MACS2 --gsize hs --nomodel --extsize 68  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K4Me1_Rep2_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K4Me1_Rep2_PR2_MACS2 --gsize hs --nomodel --extsize 68  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K4Me3_Rep1_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K4Me3_Rep1_PR1_MACS2 --gsize hs --nomodel --extsize 74  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K4Me3_Rep1_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K4Me3_Rep1_PR2_MACS2 --gsize hs --nomodel --extsize 74  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K4Me3_Rep2_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K4Me3_Rep2_PR1_MACS2 --gsize hs --nomodel --extsize 74  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K4Me3_Rep2_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K4Me3_Rep2_PR2_MACS2 --gsize hs --nomodel --extsize 74  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K27Ac_Rep1_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K27Ac_Rep1_PR1_MACS2 --gsize hs --nomodel --extsize 71  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K27Ac_Rep1_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K27Ac_Rep1_PR2_MACS2 --gsize hs --nomodel --extsize 71  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K27Ac_Rep2_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K27Ac_Rep2_PR1_MACS2 --gsize hs --nomodel --extsize 71  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K27Ac_Rep2_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K27Ac_Rep2_PR2_MACS2 --gsize hs --nomodel --extsize 71  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K27Me3_Rep1_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K27Me3_Rep1_PR1_MACS2 --gsize hs --nomodel --extsize 84  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K27Me3_Rep1_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K27Me3_Rep1_PR2_MACS2 --gsize hs --nomodel --extsize 84  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K27Me3_Rep2_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K27Me3_Rep2_PR1_MACS2 --gsize hs --nomodel --extsize 84  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K27Me3_Rep2_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K27Me3_Rep2_PR2_MACS2 --gsize hs --nomodel --extsize 84  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K4Me1_Rep1_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K4Me1_Rep1_PR1_MACS2 --gsize hs --nomodel --extsize 92  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K4Me1_Rep1_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K4Me1_Rep1_PR2_MACS2 --gsize hs --nomodel --extsize 92  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K4Me1_Rep2_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K4Me1_Rep2_PR1_MACS2 --gsize hs --nomodel --extsize 92  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K4Me1_Rep2_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K4Me1_Rep2_PR2_MACS2 --gsize hs --nomodel --extsize 92  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K4Me3_Rep1_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K4Me3_Rep1_PR1_MACS2 --gsize hs --nomodel --extsize 93  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K4Me3_Rep1_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K4Me3_Rep1_PR2_MACS2 --gsize hs --nomodel --extsize 93  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K4Me3_Rep2_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K4Me3_Rep2_PR1_MACS2 --gsize hs --nomodel --extsize 93  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K4Me3_Rep2_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K4Me3_Rep2_PR2_MACS2 --gsize hs --nomodel --extsize 93  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K27Ac_Rep1_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K27Ac_Rep1_PR1_MACS2 --gsize hs --nomodel --extsize 65  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K27Ac_Rep1_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K27Ac_Rep1_PR2_MACS2 --gsize hs --nomodel --extsize 65  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K27Ac_Rep2_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K27Ac_Rep2_PR1_MACS2 --gsize hs --nomodel --extsize 65  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K27Ac_Rep2_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K27Ac_Rep2_PR2_MACS2 --gsize hs --nomodel --extsize 65  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K27Me3_Rep1_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K27Me3_Rep1_PR1_MACS2 --gsize hs --nomodel --extsize 78  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K27Me3_Rep1_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K27Me3_Rep1_PR2_MACS2 --gsize hs --nomodel --extsize 78  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K27Me3_Rep2_PR1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K27Me3_Rep2_PR1_MACS2 --gsize hs --nomodel --extsize 78  -p $pvalPeaks 
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K27Me3_Rep2_PR2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K27Me3_Rep2_PR2_MACS2 --gsize hs --nomodel --extsize 78  -p $pvalPeaks" \
+>> ./Scripts/IDR_STEP1.3.txt
+
+# Run the analysis
+qarray \
+    -q ono \
+    -cwd \
+    -l mem_rsvd=16G \
+    -V \
+    -N IDR_Step_1.3 \
+    -e ./Std_Output/3-IDR/ \
+    -o ./Std_Output/3-IDR/ \
+    ./Scripts/IDR_STEP1.3.txt
+
+```
+
+### Peak calling on pooled pseudoreplicates of induvidual replicates
+
+```{bash, eval = FALSE}
+##-->  STEP 2.1 : Pool the two replicates and create two pooled PS
+
+# Creation of batch script
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+  if [ ! -f ./Data/3-IDR/${day}${mark}_POOLED_REP2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam.bai ] ; then echo $day $mark
+   
+    echo "\
+   #3.1 pool bam files IPs
+   samtools view -H ./Data/3-IDR/"${day}${mark}"_Rep1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam > ./Data/3-IDR/"${day}${mark}"_Header.txt ;
+   samtools merge -h ./Data/3-IDR/"${day}${mark}"_Header.txt ./Data/3-IDR/"${day}${mark}"_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ./Data/3-IDR/"${day}${mark}"_Rep*_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+   samtools index ./Data/3-IDR/"${day}${mark}"_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+
+   #3.2 get pseudo-replicates
+   #Number of reads in the tagAlign file
+   nlines=\$(samtools idxstats ./Data/3-IDR/"${day}${mark}"_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.bam | awk '{s+=\$3} END {print s}') ; nlines=\$(( (nlines + 1) / 2 )) ;
+   
+   samtools view ./Data/3-IDR/"${day}${mark}"_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.bam | shuf | split -d -l \${nlines} -  ./Data/3-IDR/"${day}${mark}"_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED ;
+   
+   #pseudorep1
+   samtools view -bT $genomeFile ./Data/3-IDR/"${day}${mark}"_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED00 > ./Data/3-IDR/"${day}${mark}"_POOLED_REP1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+   samtools sort -@ 2 ./Data/3-IDR/"${day}${mark}"_POOLED_REP1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ./Data/1-NOBLACKLIST_Bam/"${day}${mark}"_tmp1 ;
+   mv ./Data/1-NOBLACKLIST_Bam/"${day}${mark}"_tmp1.bam ./Data/3-IDR/"${day}${mark}"_POOLED_REP1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+   samtools index ./Data/3-IDR/"${day}${mark}"_POOLED_REP1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+   
+   #pseudorep2
+   samtools view -bT $genomeFile ./Data/3-IDR/"${day}${mark}"_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED01 > ./Data/3-IDR/"${day}${mark}"_POOLED_REP2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+   samtools sort -@ 2 ./Data/3-IDR/"${day}${mark}"_POOLED_REP2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ./Data/1-NOBLACKLIST_Bam/"${day}${mark}"_tmp2 ;
+   mv ./Data/1-NOBLACKLIST_Bam/"${day}${mark}"_tmp2.bam ./Data/3-IDR/"${day}${mark}"_POOLED_REP2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam ;
+   samtools index ./Data/3-IDR/"${day}${mark}"_POOLED_REP2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam" \
+   >> ./Scripts/IDR_STEP2.1_${day}${mark}.txt
+   
+  fi ;
+ done ;
+done
+
+# Run the analysis
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+    qsub \
+        -pe thread 2 \
+        -l mem_rsvd=32G \
+        -q ono \
+        -cwd \
+        -V \
+        -N IDR_Step_2.1 \
+        -e ./Std_Output/3-IDR/ \
+        -o ./Std_Output/3-IDR/ \
+        ./Scripts/IDR_STEP2.1_${day}${mark}.txt
+  done ;
+done
+
+
+##-->  STEP 2.2 : Peak calling on the two PR
+
+# Creation of batch script
+echo "\
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K4Me1_POOLED_REP1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K4Me1_POOLED_REP1_MACS2 --gsize hs --nomodel --extsize 89  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K4Me1_POOLED_REP2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K4Me1_POOLED_REP2_MACS2 --gsize hs --nomodel --extsize 89  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K4Me3_POOLED_REP1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K4Me3_POOLED_REP1_MACS2 --gsize hs --nomodel --extsize 87  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K4Me3_POOLED_REP2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K4Me3_POOLED_REP2_MACS2 --gsize hs --nomodel --extsize 87  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K27Ac_POOLED_REP1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K27Ac_POOLED_REP1_MACS2 --gsize hs --nomodel --extsize 67  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K27Ac_POOLED_REP2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K27Ac_POOLED_REP2_MACS2 --gsize hs --nomodel --extsize 67  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K27Me3_POOLED_REP1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K27Me3_POOLED_REP1_MACS2 --gsize hs --nomodel --extsize 79  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K27Me3_POOLED_REP2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K27Me3_POOLED_REP2_MACS2 --gsize hs --nomodel --extsize 79  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K4Me1_POOLED_REP1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K4Me1_POOLED_REP1_MACS2 --gsize hs --nomodel --extsize 68  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K4Me1_POOLED_REP2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K4Me1_POOLED_REP2_MACS2 --gsize hs --nomodel --extsize 68  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K4Me3_POOLED_REP1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K4Me3_POOLED_REP1_MACS2 --gsize hs --nomodel --extsize 74  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K4Me3_POOLED_REP2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K4Me3_POOLED_REP2_MACS2 --gsize hs --nomodel --extsize 74  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K27Ac_POOLED_REP1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K27Ac_POOLED_REP1_MACS2 --gsize hs --nomodel --extsize 71  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K27Ac_POOLED_REP2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K27Ac_POOLED_REP2_MACS2 --gsize hs --nomodel --extsize 71  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K27Me3_POOLED_REP1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K27Me3_POOLED_REP1_MACS2 --gsize hs --nomodel --extsize 84  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K27Me3_POOLED_REP2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K27Me3_POOLED_REP2_MACS2 --gsize hs --nomodel --extsize 84  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K4Me1_POOLED_REP1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K4Me1_POOLED_REP1_MACS2 --gsize hs --nomodel --extsize 92  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K4Me1_POOLED_REP2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K4Me1_POOLED_REP2_MACS2 --gsize hs --nomodel --extsize 92  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K4Me3_POOLED_REP1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K4Me3_POOLED_REP1_MACS2 --gsize hs --nomodel --extsize 93  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K4Me3_POOLED_REP2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K4Me3_POOLED_REP2_MACS2 --gsize hs --nomodel --extsize 93  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K27Ac_POOLED_REP1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K27Ac_POOLED_REP1_MACS2 --gsize hs --nomodel --extsize 65  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K27Ac_POOLED_REP2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K27Ac_POOLED_REP2_MACS2 --gsize hs --nomodel --extsize 65  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K27Me3_POOLED_REP1_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K27Me3_POOLED_REP1_MACS2 --gsize hs --nomodel --extsize 78  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K27Me3_POOLED_REP2_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K27Me3_POOLED_REP2_MACS2 --gsize hs --nomodel --extsize 78  -p $pvalPeaks
+
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K4Me1_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K4Me1_POOLED_MACS2 --gsize hs --nomodel --extsize 89  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K4Me1_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K4Me1_POOLED_MACS2 --gsize hs --nomodel --extsize 68  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K4Me1_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K4Me1_POOLED_MACS2 --gsize hs --nomodel --extsize 92  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K4Me3_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K4Me3_POOLED_MACS2 --gsize hs --nomodel --extsize 87  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K4Me3_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K4Me3_POOLED_MACS2 --gsize hs --nomodel --extsize 74  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K4Me3_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K4Me3_POOLED_MACS2 --gsize hs --nomodel --extsize 93  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K27Ac_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K27Ac_POOLED_MACS2 --gsize hs --nomodel --extsize 67  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K27Ac_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K27Ac_POOLED_MACS2 --gsize hs --nomodel --extsize 71  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K27Ac_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K27Ac_POOLED_MACS2 --gsize hs --nomodel --extsize 65  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D0K27Me3_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D0Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D0K27Me3_POOLED_MACS2 --gsize hs --nomodel --extsize 79  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D3K27Me3_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D3Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D3K27Me3_POOLED_MACS2 --gsize hs --nomodel --extsize 84  -p $pvalPeaks
+macs2 callpeak --tempdir ./ -t ./Data/3-IDR/D6K27Me3_POOLED_DEDUP_NOBLACKLIST_ONLYMAPPED.bam -c ./Data/1-NOBLACKLIST_Bam/D6Input_ALL_DEDUP_NOBLACKLIST_SORT.bam --name ./Data/3-IDR/D6K27Me3_POOLED_MACS2 --gsize hs --nomodel --extsize 78  -p $pvalPeaks"\
+>> ./Scripts/IDR_STEP2.2.txt
+
+# Run the analysis
+qarray \
+    -q ono \
+    -cwd \
+    -V \
+    -l mem_rsvd=16G \
+    -N IDR_Step_2.2 \
+    -e ./Std_Output/3-IDR/ \
+    -o ./Std_Output/3-IDR/ \
+    ./Scripts/IDR_STEP2.2.txt
+
+```
+
+### IDR 
+
+```{bash, eval = FALSE}
+##-->  STEP 3.1 : Sort peaks by pval and select the first 100000
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+
+   sort -k 8nr,8nr ./Data/3-IDR/${day}${mark}_POOLED_REP1_MACS2_peaks.encodePeak | head -n 100000 | gzip -c > ./Data/3-IDR/${day}${mark}_POOLED_REP1_MACS2_peaks.regionPeak.gz
+   sort -k 8nr,8nr ./Data/3-IDR/${day}${mark}_POOLED_REP2_MACS2_peaks.encodePeak | head -n 100000 | gzip -c > ./Data/3-IDR/${day}${mark}_POOLED_REP2_MACS2_peaks.regionPeak.gz
+   sort -k 8nr,8nr ./Data/3-IDR/${day}${mark}_Rep1_PR1_MACS2_peaks.encodePeak | head -n 100000 | gzip -c > ./Data/3-IDR/${day}${mark}_Rep1_PR1_MACS2_peaks.regionPeak.gz
+   sort -k 8nr,8nr ./Data/3-IDR/${day}${mark}_Rep1_PR2_MACS2_peaks.encodePeak | head -n 100000 | gzip -c > ./Data/3-IDR/${day}${mark}_Rep1_PR2_MACS2_peaks.regionPeak.gz
+   sort -k 8nr,8nr ./Data/3-IDR/${day}${mark}_Rep2_PR1_MACS2_peaks.encodePeak | head -n 100000 | gzip -c > ./Data/3-IDR/${day}${mark}_Rep2_PR1_MACS2_peaks.regionPeak.gz
+   sort -k 8nr,8nr ./Data/3-IDR/${day}${mark}_Rep2_PR2_MACS2_peaks.encodePeak | head -n 100000 | gzip -c > ./Data/3-IDR/${day}${mark}_Rep2_PR2_MACS2_peaks.regionPeak.gz
+
+ done ;
+done;
+
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+   for rep in ${reps[@]} ; do
+    
+    sort -k 8nr,8nr ./Data/3-PEAK-CALLING/MACS/Sharp/${day}${mark}_${rep}_MACS2_peaks.encodePeak | head -n 100000 | gzip -c > ./Data/3-IDR/${day}${mark}_${rep}_MACS2_peaks.regionPeak.gz
+   
+  done ;
+ done ;
+done;
+
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+    
+    sort -k 8nr,8nr ./Data/3-IDR/${day}${mark}_POOLED_MACS2_peaks.encodePeak | head -n 100000 | gzip -c > ./Data/3-IDR/${day}${mark}_POOLED_MACS2_peaks.regionPeak.gz
+
+ done ;
+done;
+
+##-->  STEP 3.2 : Run the IDR
+
+# Creation of batch script
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+     
+    echo "\
+    #IDR ANALYSIS ON ORIGINAL REPLICATES 
+    Rscript ./Data/3-IDR/batch-consistency-analysis.r ./Data/3-IDR/"${day}${mark}"_Rep1_MACS2_peaks.regionPeak.gz ./Data/3-IDR/"${day}${mark}"_Rep2_MACS2_peaks.regionPeak.gz -1 ./Data/3-IDR/"${day}${mark}"_Rep1_vs_Rep2 0 F p.value ;
+    
+    #IDR ANALYSIS ON SELF-PSEUDOREPLICATES
+    Rscript ./Data/3-IDR/batch-consistency-analysis.r ./Data/3-IDR/"${day}${mark}"_Rep1_PR1_MACS2_peaks.regionPeak.gz ./Data/3-IDR/"${day}${mark}"_Rep1_PR2_MACS2_peaks.regionPeak.gz -1 ./Data/3-IDR/"${day}${mark}"_Rep1.1_vs_Rep1.2 0 F p.value ;
+    Rscript ./Data/3-IDR/batch-consistency-analysis.r ./Data/3-IDR/"${day}${mark}"_Rep2_PR1_MACS2_peaks.regionPeak.gz ./Data/3-IDR/"${day}${mark}"_Rep2_PR2_MACS2_peaks.regionPeak.gz -1 ./Data/3-IDR/"${day}${mark}"_Rep2.1_vs_Rep2.2 0 F p.value ;
+    
+    #IDR ANALYSIS ON POOLED-PSEUDOREPLICATES
+    Rscript ./Data/3-IDR/batch-consistency-analysis.r ./Data/3-IDR/"${day}${mark}"_POOLED_REP1_MACS2_peaks.regionPeak.gz ./Data/3-IDR/"${day}${mark}"_POOLED_REP2_MACS2_peaks.regionPeak.gz -1 ./Data/3-IDR/"${day}${mark}"_pooledPRep1_vs_pooledPRep2 0 F p.value ;" \
+  >> ./Scripts/IDR_STEP3.2_${day}${mark}.txt
+  
+  done;
+done;
+
+
+# Run the analysis
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+    qarray \
+        -l mem_rsvd=8G \
+        -q ono \
+        -cwd \
+        -V \
+        -N IDR_Step_3.2 \
+        -e ./Std_Output/3-IDR/ \
+        -o ./Std_Output/3-IDR/ \
+        ./Scripts/IDR_STEP3.2_${day}${mark}.txt
+  done ;
+done
+
+##-->  STEP 3.3 : Summarize the results
+
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+     
+  sigRep=.02 ; sigPRep=.02 ; sigPooledPrep=.005
+  numPeaks_Rep1Rep2=$(awk -v s=$sigRep '$11 <= s {print $0}' ./Data/3-IDR/${day}${mark}_Rep1_vs_Rep2-overlapped-peaks.txt | wc -l)
+  numPeaks_PRep11PRep12=$(awk -v s=$sigPRep '$11 <= s {print $0}' ./Data/3-IDR/${day}${mark}_Rep1.1_vs_Rep1.2-overlapped-peaks.txt | wc -l)
+  numPeaks_PRep21PRep22=$(awk -v s=$sigPRep '$11 <= s {print $0}' ./Data/3-IDR/${day}${mark}_Rep2.1_vs_Rep2.2-overlapped-peaks.txt | wc -l)
+  numPeaks_pooledPRep1PRep2=$(awk -v s=$sigPooledPrep '$11 <= s {print $0}' ./Data/3-IDR/${day}${mark}_pooledPRep1_vs_pooledPRep2-overlapped-peaks.txt | wc -l)
+    
+  echo $mark $day  
+  echo $numPeaks_Rep1Rep2 $numPeaks_pooledPRep1PRep2 : reps vs pooled
+  echo $numPeaks_PRep11PRep12 $numPeaks_PRep21PRep22 : preps
+
+  if [ $numPeaks_Rep1Rep2 -gt $numPeaks_pooledPRep1PRep2 ] ; then opTh=$numPeaks_Rep1Rep2 ; else opTh=$numPeaks_pooledPRep1PRep2 ; fi
+
+  echo choosen opTh $opTh 
+
+  zcat ./Data/3-IDR/${day}${mark}_POOLED_MACS2_peaks.regionPeak.gz  | sort -k8nr,8nr | head -n $opTh > ./Data/3-IDR/${day}${mark}_MACS2_OPTIMAL_IDR.bed
+  
+ done;
+done;
+
+```
+
+## Super-enhancer calling
+
+### Merge biological replicates
+
+```{bash, eval = FALSE}
+##-->  Creation of batch script
+marks=(K27Ac)
+days=(D0 D3 D6)
+reps=(Rep1 Rep2)
+    
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+     
+     echo "\
+     samtools view -H ./Data/1-NOBLACKLIST_Bam/"${day}${mark}"_Rep1_DEDUP_NOBLACKLIST.bam > ./Data/5-HMM/"${day}${mark}"_Header.txt ;
+     samtools merge -h ./Data/5-HMM/"${day}${mark}"_Header.txt ./Data/1-NOBLACKLIST_Bam/"${day}${mark}"_MERGE_DEDUP_NOBLACKLIST.bam ./Data/1-NOBLACKLIST_Bam/"${day}${mark}"_Rep1_DEDUP_NOBLACKLIST.bam ./Data/1-NOBLACKLIST_Bam/"${day}${mark}"_Rep1_DEDUP_NOBLACKLIST.bam ;" \
+     >> ./Scripts/HMM_MERGE_${day}${mark}.txt
+
+ done ;
+done
+
+##-->  Run the analysis
+for mark in ${marks[@]} ; do
+ for day in ${days[@]} ; do
+    qsub \
+        -q ono \
+        -cwd \
+        -V \
+        -N HMM_MERGE \
+        -e ./Std_Output/5-HMM_PREPROS/ \
+        -o ./Std_Output/5-HMM_PREPROS/ \
+        ./Scripts/HMM_MERGE_${day}${mark}.txt
+ done ;
+done
+
+##--> Index alignments
+for i in $(ls ./Data/1-NOBLACKLIST_Bam/ |grep _MERGE_DEDUP_NOBLACKLIST.bam)
+do
+    qsub -q ono -cwd -V -b y samtools index ./Data/1-NOBLACKLIST_Bam/$i
+done
+```
+
+
+### Subsampling
+
+```{bash, eval = FALSE}
+##-->  Creation of batch script
+for mark in ${marks[@]} ;
+    do
+    echo $mark
+    nlinesD0=$(samtools idxstats ./Data/1-NOBLACKLIST_Bam/"D0${mark}"_MERGE_DEDUP_NOBLACKLIST.bam | awk '{s+=$3} END {print s}');
+    nlinesD3=$(samtools idxstats ./Data/1-NOBLACKLIST_Bam/"D3${mark}"_MERGE_DEDUP_NOBLACKLIST.bam | awk '{s+=$3} END {print s}');
+    nlinesD6=$(samtools idxstats ./Data/1-NOBLACKLIST_Bam/"D6${mark}"_MERGE_DEDUP_NOBLACKLIST.bam | awk '{s+=$3} END {print s}');
+    nlinesMin=$(echo "$nlinesD0"; echo "$nlinesD3"; echo "$nlinesD6");
+    nlinesMin=$(echo $nlinesMin |sed 's/\s/\n/g' | sort -n| head -n1);
+    probD0=$(echo $nlinesMin $nlinesD0 | awk '{print $1/$2}')
+    probD3=$(echo $nlinesMin $nlinesD3 | awk '{print $1/$2}')
+    probD6=$(echo $nlinesMin $nlinesD6 | awk '{print $1/$2}')
+    prob=($probD0 $probD3 $probD6)
+
+    days=(D0 D3 D6)
+    i=0
+    
+    for day in ${days[@]}
+    do
+        echo "java -jar -Xmx16g ~/bin/Tools/PicardTools_v1.130/picard.jar \
+              DownsampleSam \
+              PROBABILITY=${prob[i]} \
+              I=./Data/1-NOBLACKLIST_Bam/"${day}${mark}"_MERGE_DEDUP_NOBLACKLIST.bam \
+              O=./Data/1-NOBLACKLIST_Bam/"${day}${mark}"_MERGE_DEDUP_NOBLACKLIST_DOWNSAMPLED.bam" \
+        >> ./Scripts/HMM_DOWNSAMPLING.txt
+    i=$i+1
+    
+    done
+done
+
+##--> Run the analysis        
+qarray \
+    -q ono \
+    -cwd \
+    -V \
+    -N HMM_DOWNSAMPLING \
+    -e ./Std_Output/5-HMM_PREPROS/  \
+    -o ./Std_Output/5-HMM_PREPROS/  \
+    ./Scripts/HMM_DOWNSAMPLING.txx
+```
+
+### Super-enhancer calling
+
+```{bash, eval = FALSE}
+##--> Convert .bed to .gff
+for i in $(ls ./Data/0-Raw-Fastq/ | grep "fastq" | sed 's/.fastq//g' | grep -v "Input" | sed 's/_Rep[12]//g' | sort -u)
+do
+    cat ./Data/3-IDR/"$i"_MACS2_OPTIMAL_IDR.bed \
+    | awk '{print $1 "\t" $1 "_" $2 "_" $3 "\t\t" $2 "\t" $3 "\t\t.\t\t" $1 "_" $2 "_" $3}' > ./Data/6-SUPER-ENHANCERS/"$i"_MACS2_OPTIMAL_IDR.gff
+done
+
+
+##--> Super-peak calling
+
+# Creation of batch script
+for i in $(ls ./Data/0-Raw-Fastq/ | grep "fastq" | sed 's/.fastq//g' | grep -v "Input" | sed 's/_Rep[12]//g' | sort -u)
+do
+    echo "python ./ROSE_main.py \
+            -g HG19 \
+            -i ./Data/6-SUPER-ENHANCERS/"$i"_MACS2_OPTIMAL_IDR.gff \
+            -r ./Data/1-NOBLACKLIST_Bam/"$i"_MERGE_DEDUP_NOBLACKLIST_DOWNSAMPLED.bam \
+            -o ./Data/6-SUPER-ENHANCERS/"$i" \
+            -s 12500 \
+            --tempdir ./ -t 2500"\
+    >> ./Scripts/ROSE_SE.txt
+done
+
+# Run the analysis
+qarray \
+    -q ono \
+    -cwd \
+    -V \
+    -e ./Std_Output/6-ROSE_SE/ \
+    -o ./Std_Output/6-ROSE_SE/ \
+    -N ROSE_SE \
+    ./Scripts/ROSE_SE.txt
+```
+
+# Prepare annotation
+
+```{r}
+##--> Load the GenomicRanges and rtracklayer package
+library(GenomicRanges)
+library(rtracklayer)
+
+##--> Import annotation
+annot_chip <- read.table("./results/MICROARRAY_ANNOTATION_BIOCONDUCTOR.txt", sep = "\t",
+                         header = TRUE, stringsAsFactors = FALSE)
+
+##--> Format
+annot_chip <- annot_chip[-which(is.na(annot_chip$Chromosome) |
+                                is.na(annot_chip$Start) |
+                                is.na(annot_chip$Stop)),]
+
+annot_chip <- GRanges(seqnames = paste("chr", annot_chip$Chromosome, sep = ""),
+                      IRanges(start = annot_chip$Start, end = annot_chip$Stop),
+                      mcols = data.frame(probes = as.character(annot_chip$Probe_ID),
+                                         gene = as.character(annot_chip$HGNC_Symbol)))
+
+##--> Liftover from hg38 to hg19
+chain <- import.chain("./tools/hg38ToHg19.over.chain")
+annot_chip <- unlist(liftOver(annot_chip, chain))
+```
+
+# Quality check
+
+## Genome-wide correlation heatmap
+
+To generate the pairwise correlation matrix required to plot a genome-wide correlation heatmap for all of our alignment files, we need to :
+
+ * cut the genome in bins of fixed size (i.e. 1kb),
+ * count the number of reads aligned on each of these bins for each alignment files,
+ * remove bins on which no alignment is reported in all of the alignment files (otherwise, it will artificially increase the correlation),
+ * compute the pairwise Pearson's correlation matrix.
+
+### Preparing data
+
+```{r}
+##--> Load the GenomicRanges package
+library(GenomicRanges)
+library(GenomicAlignments)
+library(BiocParallel)
+
+##--> List alignment files
+bam <- list.files(path = "./data/ChIP-seq/",
+                  pattern = ".bam$",
+                  full = TRUE)
+
+library(BSgenome.Hsapiens.UCSC.hg19)
+genome <- BSgenome.Hsapiens.UCSC.hg19
+
+##--> Use the tileGenome function to tile the genome
+tile <- tileGenome(seqlengths(genome), tilewidth = 1000)
+```
+
+### Counting reads inside each bin
+
+```{r}
+##--> Compute genome-wide coverage 
+# Create a function to compute the coverage
+summarizeOverlaps_batch <- function(bam) {
+    count <- summarizeOverlaps(tile, bam,ignore.strand = TRUE, inter.feature = FALSE)
+    return(count)
+}
+
+# Run the counting in multi-thread
+count_all <- bplapply(bam, summarizeOverlaps_batch, BPPARAM = MulticoreParam())
+
+# Transform the SummarizedExperiment object in numeric matrix
+count_all_matrix <- do.call(cbind, lapply(count_all, assay))
+
+# Change names of columns
+colnames(count_all_matrix) <- gsub("RAS_OIS_CHIPSEQ_HISTONE_|\\.bam", "", colnames(count_all_matrix)) 
+
+##--> Indentifying and removing bins with no read
+# Sum across lines of the count matrix
+zero <- apply(count_all_matrix, 1, sum)
+
+# Remove lines for which the sum == 0
+count_all_matrix_clean <- count_all_matrix[-which(zero==0),]
+```
+
+### Creating the pairwise correlation matrix
+
+```{r}
+##--> Calculate pariwise Pearson's correlation
+cor_count_all_matrix_clean <- cor(count_all_matrix_clean, method = "pearson")
+```
+
+### Drawing the correlation heatmap
+
+```{r, fig.cap= "Pair-wise Pearson's correlation heatmap for genome-wide histone modification ChIP-seq", fig.height=10}
+##--> Load the gplots package
+library(pheatmap)
+library(colorRamps)
+
+##--> Draw heatmap
+pheatmap(cor_count_all_matrix_clean,
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation",
+         clustering_method = "ward.D2",
+         main = "Pair-wise Pearson's correlation heatmap",
+         color = matlab.like(c(1000)))
+```
+
+## Saturation analysis
+
+For the saturation analysis, we will use the raw count matrix `count_all_matrix` that includes bins of the genome where no read aligns. Based on these counts, for each library independently, we then interpolate a species accumulation curve using the package `r CRANpkg("preseqR")`.This allows to predict the molecular complexity of sequencing libraries. The idea is to use the information gained from the number of times each 1kb is observed to predict the number of new, currently unobserved, bins that will be gained from additional sequencing.
+
+```{r, fig.cap= "Species accumulation curves for genome-wide histone modification ChIP-seq", fig.height=10}
+##--> Load the preseqR package
+library(preseqR)
+
+##--> Select data for the saturation analysis
+saturation <- count_all_matrix
+
+##--> Create the object used to output the results for each saturation analysis
+saturation_res <- data.frame()
+
+##--> Runing saturation analysis for each library
+for (i in 1:ncol(saturation)) {
+  table <- table(saturation[,i])
+  test <- preseqR.interpolate.distinct(1000000, as.matrix(data.frame(cbind(as.double(names(table)),table)))[-1,])
+  test <- data.frame(test)
+  test$Name <- rep(colnames(saturation)[i],nrow(test))
+  saturation_res <- rbind(saturation_res, test)
+}
+
+##--> Reordering the output for clarity
+saturation_res$Lib_Type <- as.factor(gsub("_REP.$|.*H_|.*T0_", "", saturation_res$Name))
+saturation_res$Day <- factor(gsub("_.*", "", saturation_res$Name),  levels = c("T0", "72H", "144H"))
+saturation_res$Rep <- as.factor(gsub(".*_", "", saturation_res$Name))
+
+##--> Ploting results
+library(ggplot2)
+saturation_plot <- ggplot(saturation_res, aes(x = sample.size, y = interpolation)) +
+  geom_point(aes(fill = Rep), alpha = 0.7, colour="black",pch=21, size=1) +
+  facet_grid(Lib_Type ~ Day) +
+  scale_x_continuous(name = "Number of mapped reads") +
+  scale_y_continuous(name = "Number of 1kb bins covered") +
+  ggtitle("Mapped-bins accumulation curves for mapped reads in each libraries") +
+  theme_bw()
+saturation_plot
+```
+
+## Genome-wide profiles around TSS
+
+Before starting this analysis, we need to retrieve the coordinates of TSS on a data-base such as UCSC or Biomart.
+
+### Preparing the data 
+
+```{r}
+##--> Load the biomeRt and the biovizBase packages
+library(biomaRt)
+library(biovizBase)
+
+##--> Connexion to BioMart hg19 (aka GRCh37)
+ensembl <- useMart(biomart="ENSEMBL_MART_ENSEMBL",
+                   host="grch37.ensembl.org",
+                   path="/biomart/martservice",
+                   dataset="hsapiens_gene_ensembl")
+
+##--> Retrive the coordinates of TSSs
+tss <- getBM(mart = ensembl,
+             attributes = c("chromosome_name", "transcript_start", "hgnc_symbol", "strand"))
+
+##--> Format the chromosome name column (to match the chromosome names in alignement files)
+set.seed(1234)
+tss <- tss[grep("^[1-9]{1,2}$", tss$chromosome_name),]
+tss <- tss[sample(1:nrow(tss), 5000),]
+tss$chromosome_name <- paste("chr", tss$chromosome_name, sep = "")
+
+##--> Creating a GRange containing the information related to TSSs
+# And add a +/- 1kb window
+tss_gr <- GRanges(seqnames = tss$chromosome_name,
+                  ranges = IRanges(start = tss$transcript_start - 1000,
+                                   end = tss$transcript_start + 1000,
+                                   names = tss$hgnc_symbol),
+                  strand = tss$strand)
+
+##--> For each TSS +/- 5kb, tile the window in 100bp bins
+tss_split <- tile(tss_gr, n = 100) # Give a GRangesList
+tss_split <- flatGrl(tss_split)   # Transform GRangesList to GRanges
+```
+
+Now that the object containing information related to TSSs is formated, we will first list the alignement files we are interested in, and count the reads overlapping each tiles consituting each TSS window.
+
+### Counting reads inside each bin
+
+```{r}
+##--> Create a function to compute the coverage
+summarizeOverlaps_tss_batch <- function(bam) {
+    count <- summarizeOverlaps(tss_split, bam,ignore.strand = TRUE, inter.feature = FALSE)
+    return(count)
+}
+
+##--> Count reads in bins
+count_tss <- bplapply(bam, summarizeOverlaps_tss_batch, BPPARAM = MulticoreParam())
+
+##--> Transform the SummarizedExperiment object in numeric matrix
+count_tss_matrix <- do.call(cbind, lapply(count_tss, assay))
+
+##--> Change names of columns
+colnames(count_tss_matrix) <- gsub("RAS_OIS_CHIPSEQ_HISTONE_|\\.bam", "", colnames(count_tss_matrix)) 
+```
+
+### Formating output and plot
+
+```{r, fig.cap= "TSS metaprofiles for histone modification ChIP-seq", fig.height=7}
+mark <- factor(gsub("_REP.$|.*H_|.*T0_", "", colnames(count_tss_matrix)))
+day  <- factor(gsub("_.*", "", colnames(count_tss_matrix)),  levels = c("T0", "72H", "144H"))
+
+##--> Create a table containing normalized counts (RPM)
+count_tss_matrix_2 <- data.frame()
+
+for (i in levels(mark)[-6]) {
+  for (j in levels(day)) {
+    
+    tmp <- count_tss_matrix[,grep(paste(j,i, sep = "_"), colnames(count_tss_matrix))]
+    
+    tmp_rep1 <- t(matrix(tmp[,1], nrow=100) / sum(tmp[,1]) * 1000000)
+    mean_tss_rep1 <- apply(tmp_rep1, 2, mean)
+    
+    tmp_rep2 <- t(matrix(tmp[,2], nrow=100) / sum(tmp[,2]) * 1000000)
+    mean_tss_rep2 <- apply(tmp_rep2, 2, mean)
+    
+    mean_tss <- apply(cbind(mean_tss_rep1,  mean_tss_rep2), 1, mean)
+    mean_tss_final <- cbind(mean_tss, seq(-5000,4999,100),
+                            rep(i, length(mean_tss)), rep(j, length(mean_tss)))
+    
+    count_tss_matrix_2 <- rbind(count_tss_matrix_2, mean_tss_final)
+  }
+}
+
+##--> Create Plots
+colnames(count_tss_matrix_2) <- c("RPKM", "Dist_to_TSS", "Mark", "Time")
+count_tss_matrix_2$RPKM <- as.numeric(as.character(count_tss_matrix_2$RPKM))
+count_tss_matrix_2$Dist_to_TSS <- as.numeric(as.character(count_tss_matrix_2$Dist_to_TSS))
+ggplot(count_tss_matrix_2, aes(x = Dist_to_TSS, y = RPKM)) +
+  geom_line(aes(color=Time)) +
+  facet_wrap(~Mark) +
+  scale_color_manual(values = rainbow(n=6)[c(1,5,6)]) +
+  scale_x_continuous(name = "Distance to TSS (bp)") +
+  scale_y_continuous(name = "Average read per million mapped reads (N)") +
+  ggtitle("TSS metaprofiles for histone modification ChIP-seq") +
+  theme_bw()
+
+```
+
+# Match epigenome with transcriptome
+
+## Split TSS according to expression level
+
+```{r}
+##--> Retrive the coordinates of TSSs
+tss <- getBM(mart =  ensembl,
+             attributes = c("chromosome_name",
+                            "transcription_start_site",
+                            "transcript_start",
+                            "transcript_end",
+                            "hgnc_symbol",
+                            "strand",
+                            "affy_hta_2_0"))
+
+##--> Format the chromosome name column (to match the chromosome names in alignement files)
+tss <- tss[grep("^[1-9]{1,2}|^X|^Y", tss$chromosome_name),]
+tss$chromosome_name <- paste("chr", tss$chromosome_name, sep = "")
+
+
+##--> Compute expression qualtile at T0
+data_transcriptome <- read.table("./results/TIMECOURSE_RAS_Q_LIMMA_WGCNA.txt", header = TRUE, sep ="\t")
+average_t0 <- data_transcriptome$RAS_1_0
+names(average_t0) <- data_transcriptome$Row.names
+qt_t0 <- quantile(average_t0, seq(0, 1, 1/10))[c(2:11)]
+
+##--> Select data for each quantile
+qt1_t0  <- unique(names(average_t0[which(average_t0 < qt_t0[1])]))
+qt2_t0  <- unique(names(average_t0[which(average_t0 > qt_t0[1] & average_t0 < qt_t0[2])]))
+qt3_t0  <- unique(names(average_t0[which(average_t0 > qt_t0[2] & average_t0 < qt_t0[3])]))
+qt4_t0  <- unique(names(average_t0[which(average_t0 > qt_t0[3] & average_t0 < qt_t0[4])]))
+qt5_t0  <- unique(names(average_t0[which(average_t0 > qt_t0[4] & average_t0 < qt_t0[5])]))
+qt6_t0  <- unique(names(average_t0[which(average_t0 > qt_t0[5] & average_t0 < qt_t0[6])]))
+qt7_t0  <- unique(names(average_t0[which(average_t0 > qt_t0[6] & average_t0 < qt_t0[7])]))
+qt8_t0  <- unique(names(average_t0[which(average_t0 > qt_t0[7] & average_t0 < qt_t0[8])]))
+qt9_t0  <- unique(names(average_t0[which(average_t0 > qt_t0[8] & average_t0 < qt_t0[9])]))
+qt10_t0 <- unique(names(average_t0[which(average_t0 > qt_t0[9] & average_t0 <= qt_t0[10])]))
+
+qt_all <- data.frame(Gene = c(as.character(qt1_t0),
+                              as.character(qt2_t0),
+                              as.character(qt3_t0),
+                              as.character(qt4_t0),
+                              as.character(qt5_t0),
+                              as.character(qt6_t0),
+                              as.character(qt7_t0),
+                              as.character(qt8_t0),
+                              as.character(qt9_t0),
+                              as.character(qt10_t0)),
+                     QT =   c(rep("QT1", length(qt1_t0)),
+                              rep("QT2", length(qt2_t0)),
+                              rep("QT3", length(qt3_t0)),
+                              rep("QT4", length(qt4_t0)),
+                              rep("QT5", length(qt5_t0)),
+                              rep("QT6", length(qt6_t0)),
+                              rep("QT7", length(qt7_t0)),
+                              rep("QT8", length(qt8_t0)),
+                              rep("QT9", length(qt9_t0)),
+                              rep("QT10", length(qt10_t0))))
+
+tss_qt <- merge(qt_all, tss, by.x = "Gene", by.y = "affy_hta_2_0")
+
+##--> Creating a GRange containing the information related to TSSs
+# And add a +/- 10kb window
+library(GenomicRanges)
+tss_gr <- GRanges(seqnames = tss_qt$chromosome_name,
+                  ranges = IRanges(start = tss_qt$"transcription_start_site" - 10000,
+                                   end = tss_qt$"transcription_start_site" + 10000,
+                                   names = tss_qt$hgnc_symbol),
+                  strand = tss_qt$strand,
+                  annot = data.frame(QT = tss_qt$QT))
+
+
+##--> Split +/- TSS               
+library(plyr)
+library(rtracklayer)
+library(R.utils)
+library(biovizBase)
+
+tss_gr_plus  <- tss_gr[which(strand(tss_gr) == "+")]
+tss_gr_plus_split <- tile(tss_gr_plus, n = 1000)
+tss_gr_plus_split <- flatGrl(tss_gr_plus_split)
+tss_gr_minus  <- tss_gr[which(strand(tss_gr) == "-")]
+tss_gr_minus_split <- tile(tss_gr_minus, n = 1000)
+tss_gr_minus_split <- flatGrl(tss_gr_minus_split)
+```
+
+## Compute coverages across TSS
+
+```{r}
+##--> List input averages and normalized BigWig files
+bw <- list.files(path ="./data/ChIP-seq/", pattern = "HISTONE.*T0.*bw", full = TRUE)
+
+##--> Count signal in bins
+counts_plus  <- matrix(NA, nrow = length(tss_gr_plus_split), ncol = 4)
+counts_minus <- matrix(NA, nrow = length(tss_gr_minus_split), ncol = 4)
+
+chrs <- c(paste("chr", seq(1, 22), sep = ""))
+
+for(i in c(1:length(bw))) {
+  
+  print(i)
+  
+  coverage <- import(bw[i], as = 'RleList')
+
+    for(chr in chrs) {
+
+      counts_plus[which(seqnames(tss_gr_plus_split) == chr) , i] <-
+        mean(Views(coverage[[which(names(coverage) == chr)]], 
+                   ranges(tss_gr_plus_split[seqnames(tss_gr_plus_split) == chr])))
+        
+        counts_minus[which(seqnames(tss_gr_minus_split) == chr) , i] <-
+        mean(Views(coverage[[which(names(coverage) == chr)]],
+                   ranges(tss_gr_minus_split[seqnames(tss_gr_minus_split) == chr])))
+        
+    }
+}
+
+##--> Format outputs
+count_K27ac  <- rbind(t(matrix(counts_plus[,1], nrow = 1000)),
+                       t(matrix(counts_minus[,1], nrow = 1000))[,rev(1:1000)])
+count_K27me3 <- rbind(t(matrix(counts_plus[,2], nrow = 1000)),
+                       t(matrix(counts_minus[,2], nrow = 1000))[,rev(1:1000)])
+count_K4me1  <-  rbind(t(matrix(counts_plus[,3], nrow = 1000)),
+                       t(matrix(counts_minus[,3], nrow = 1000))[,rev(1:1000)])                     
+count_K4me3  <-  rbind(t(matrix(counts_plus[,4], nrow = 1000)),
+                       t(matrix(counts_minus[,4], nrow = 1000))[,rev(1:1000)])
+```
+
+### Build the metaprofiles 
+
+```{r, cache.lazy = FALSE, fig.cap= "Relationship between histone modification ChIP-seq signal and expression level at T0", fig.height=7}
+##--> Format outputs
+count_all_1 <- list(count_K27ac, count_K27me3, count_K4me1, count_K4me3)
+count_all_2 <- lapply(count_all_1, function(x) {
+                                c(unlist(by(x, c(tss_gr_plus, tss_gr_minus)$annot.QT, function(y) {
+                                    colMeans(y, na.rm = TRUE)
+                                    })))
+                              })
+count_all_3 <- data.frame(Quantile = rep(rep(levels(c(tss_gr_plus, tss_gr_minus)$annot.QT), each = 1000),4), 
+                      Pos = c(rep(rep(seq(from = -10000, to = 9999, by = 20),10),4)),
+                      Histone = rep(c("H3K27Ac", "H3K27Me3", "H3K4Me1", "H3K4Me3"), each = 10000),
+                      Reads = unlist(count_all_2))
+count_all_3$Quantile <- factor(count_all_3$Quantile, levels = c("QT1", "QT2", "QT3", "QT4", "QT5",
+                                                                "QT6", "QT7", "QT8", "QT9", "QT10"))
+##--> Plot profiles
+ggplot(count_all_3, aes(x = Pos, y = Reads)) +
+  geom_line(aes(alpha = Quantile, color = Quantile)) +
+  scale_color_manual(values = matlab.like(10)) +
+  scale_alpha_discrete(range = c(0.1, 1)) +
+  facet_wrap(~Histone, scale = "free", nrow = 2) +
+  scale_x_continuous(name = "Distance to TSS (bp)") +
+  scale_y_continuous(name = "Reads") +
+  theme_bw()
+```
+
+# Differential analysis - Regular pics
+
+Alignment and peak data are imported and pre-processed in R using the DiffBind package. Briefly, for a given histone modification type, we first defined the global reproducible peak set as the union of each time-specific reproducible peak sets defined previously. We then count the number of reads mapping inside each of these intervals at each time point and for each replicate. The raw count matrix is then normalized for sequencing depth using a non-linear full quantile normalization as implemented in the EDASeq package. To remove sources of unwanted variation and consider batch effects, data is finally corrected with the RUVSeq package considering 2 surrogate variables. Differential analyses for count data are performed using edgeR considering time and batch in the design matrix, by fitting a negative binomial generalized log-linear model to the read counts for each peak. Peaks are finally annotated using ChIPpeakAnno. 
+
+## Setting the environment 
+
+```{r}
+#--> Loading libraries
+library("DiffBind")
+library("DESeq2")
+library("biomaRt")
+library("GenomicFeatures")
+library("org.Hs.eg.db")
+
+#--> Listing the samples
+path_to_samples <- "./data/ChIP-seq/Plan_Expe_ChIP_DiffBind_"
+```
+
+## Import data
+
+```{r}
+#--> Creating a function to input data into DiffBind and output a count matrix
+input_diffbind <- function(x, y) {
+  
+  #--> Read experimental design
+  sample_sheet <-  read.csv(paste(path_to_samples, x, ".csv", sep = ""), sep = ";")
+  
+  #--> Create the global DBA object
+  expe <- dba(sampleSheet = sample_sheet, skipLines = 0, bRemoveM=TRUE)
+  expe_consensus <- dba.peakset(expe, consensus = -DBA_REPLICATE)
+  expe_ol <- dba.overlap(expe_consensus,  expe_consensus$masks$Consensus)
+  
+  #--> Draw a Venn Diagramm
+  # Get the data
+  D0 <- dba.peakset(expe, peaks = expe$masks$D0, consensus=-DBA_REPLICATE, bRetrieve = TRUE)
+  D3 <- dba.peakset(expe, peaks = expe$masks$D3, consensus=-DBA_REPLICATE, bRetrieve = TRUE)
+  D6 <- dba.peakset(expe, peaks = expe$masks$D6, consensus=-DBA_REPLICATE, bRetrieve = TRUE)
+  
+  # Load libraries
+  library(ChIPpeakAnno)
+  library(eulerr)
+  library(colorRamps)
+  
+  # Format data
+  ol <- findOverlapsOfPeaks(D0, D3, D6)
+  venn_data <- ol$venn_cnt[,"Counts"][-1]
+  names(venn_data) <- c("D6", "D3", "D3&D6", "D0", "D0&D6", "D0&D3", "D0&D3&D6")
+  venn_data <- venn_data[c(4,2,1,3,5,6,7)]
+  venn_p <- euler(venn_data)
+  
+  # Create consensus peakset
+  consensus <- dba.peakset(expe, consensus = DBA_FACTOR)
+  peaks <- dba.peakset(consensus, consensus$masks$ALL, bRetrieve=TRUE)
+ 
+  # Count binding in consensus peaks for D0 and D6
+  count <- dba.count(expe,
+                     peaks = peaks,
+                     score = DBA_SCORE_READS,
+                     bLog = TRUE,
+                     fragmentSize = y,
+                     bParallel = TRUE)
+  
+  # Outputing the binding matrix containing filtered row counts
+  b_matrix <- dba.peakset(count, bRetrieve=TRUE, DataType=DBA_DATA_FRAME)
+  
+  return(list(b_matrix, venn_p))
+}
+
+# Apply this function for each histone modificiation
+histone <- c("K4Me1", "K4Me3", "K27Ac", "K27Me3")
+fragment_size <- data.frame(K4Me1 =  c(120,215,135,130,150,215,0,0,0),
+                            K4Me3 =  c(125,215,140,140,145,220,0,0,0),
+                            K27Ac =  c(125,135,140,130,125,130,0,0,0),
+                            K27Me3 = c(160,150,160,175,155,160,0,0,0))
+
+count_H3K4me1  <- input_diffbind (histone[1], fragment_size[,1])
+count_H3K4me3  <- input_diffbind (histone[2], fragment_size[,2])
+count_H3K27ac  <- input_diffbind (histone[3], fragment_size[,3])
+count_H3K27me3 <- input_diffbind (histone[4], fragment_size[,4])
+```
+
+## Compare pic sets
+
+```{r, fig.cap= "Comparison of reproducible histone modification ChIP-seq pics between time points", fig.height=8.5}
+library(gridExtra)
+
+fill = list(fill = rainbow(n=6)[c(1,5,6)], alpha = 0.5)
+
+P1 <- plot(count_H3K4me1[[2]], quantitie = TRUE, main = "H3K4me1", fills = fill)
+P2 <- plot(count_H3K4me3[[2]], quantitie = TRUE, main = "H3K4me3", fills = fill)
+P3 <- plot(count_H3K27ac[[2]], quantitie = TRUE, main = "H3K27ac", fills = fill)
+P4 <- plot(count_H3K27me3[[2]], quantitie = TRUE, main = "H3K27me3", fills = fill)
+
+grid.arrange(P1, P2, P3, P4, nrow =2)
+```
+
+### Estimate parameters for batch effect correction
+
+```{r}
+library(RUVSeq)
+library(RColorBrewer)
+
+type <- c("D0", "D0", "D3", "D3", "D6", "D6" )
+
+#--> Creating a function for RUVSeq analysis
+input_RUV <- function(x) {
+  
+  data_RUVs <- matrix(as.numeric(unlist(x[,-c(1:3)])), nrow = nrow(x[,-c(1:3)]))
+
+  set <- newSeqExpressionSet(counts = data_RUVs)
+  differences <- matrix(data = c(1,3,5,2,4,6), ncol = 2)
+  
+  set_RUVs <- RUVs(x = set, cIdx = row.names(set), k = 1, scIdx = differences)
+  colnames(set_RUVs) <- c("D0_1", "D0_2", "D3_1", "D3_2", "D6_1", "D6_2")
+
+  colors <- brewer.pal(6, "Set1")
+  factor <- as.factor(type)
+
+  return(list(pData(set_RUVs), set_RUVs))
+}
+
+RUV <- lapply(list(count_H3K4me1[[1]], count_H3K4me3[[1]],
+                   count_H3K27ac[[1]], count_H3K27me3[[1]]), input_RUV)
+```
+
+
+### DE analysis with edgeR
+
+```{r, fig.cap= "Differential analysis for histone modification ChIP-seq time-courses: MA-plots", fig.height=10}
+library(edgeR)
+
+#--> Creating a function for edgeR analysis
+edger_batch <- function(x, y, z, a) {
+  
+  data_edger <- x
+  samples <- data.frame(Data_Edger  = colnames(data_edger[,-c(1:3)]),
+                        Time = c(rep(c("D0", "D3", "D6"), each = 2)),
+                        Batch = rep(c("Run1", "Run2"), time=3))
+  design <- cbind(model.matrix(~ samples$Time), y)
+  
+  
+  data_edger  <- DGEList(counts = data_edger[,-c(1:3)],group = samples$Time,
+                         genes = paste(data_edger[,1], data_edger[,2], data_edger[,3], sep= "_"))
+  data_edger <- calcNormFactors(data_edger, method = "none")
+  data_edger <- estimateGLMRobustDisp(data_edger, design)
+
+  fit <- glmFit(data_edger, design = design)
+  lrt <- glmLRT(fit, coef = c(2,3))
+  top_t <- topTags(lrt, n = Inf)$table
+
+  # Output
+  DE_tags <- data.frame(topTags(lrt, n = Inf))
+  DE_tags$RGB <- "0,0,0"
+  DE_tags[which(DE_tags$FDR < 0.1 & DE_tags$logFC.samples.TimeD6 > a) ,]$RGB <- "255,255,0"
+  DE_tags[which(DE_tags$FDR < 0.1 & DE_tags$logFC.samples.TimeD6 < -a) ,]$RGB <- "0,0,255"
+
+
+  bed_edger <- data.frame(seqnames=strsplit2(DE_tags[,1],"_")[,1],
+                              starts = strsplit2(DE_tags[,1],"_")[,2],
+                              ends = strsplit2(DE_tags[,1],"_")[,3],
+                              name = DE_tags[,1],
+                              score = DE_tags$LR,
+                              strand = rep("*", nrow(DE_tags)),
+                              start2 = strsplit2(DE_tags[,1],"_")[,2],
+                              end2 = strsplit2(DE_tags[,1],"_")[,2],
+                              RGB = DE_tags$RGB,
+                              FDR = DE_tags$FDR)
+
+  bed_edger <- bed_edger[with(bed_edger, order(seqnames, as.numeric(as.character(starts)))),]
+  #write.table(BED_EDGER,paste("./results/", z,"_Consensus_DB_EDGER.bed", sep = ""), sep="\t", quote=F, col.names=F, row.names=F)
+  #write.table(DE_TAGS,  paste("./results/", z,"_Consensus_DB_EDGER.txt", sep = ""), sep="\t", quote=F, col.names=T, row.names=F)
+  
+  row.names(DE_tags) <- DE_tags[,1]
+  
+  norm_tags <- cpm(data_edger, normalized.lib.sizes=TRUE)
+  row.names(norm_tags) <- DE_tags[,1]
+  
+  P <- ggplot() +
+         geom_point(data = DE_tags, aes(y = logFC.samples.TimeD6, x = logCPM)) +
+         geom_point(data = subset(DE_tags, RGB == "0,0,255"),
+                    aes(y = logFC.samples.TimeD6, x = logCPM), color = "firebrick1") +
+         geom_point(data = subset(DE_tags, RGB == "255,255,0"),
+                    aes(y = logFC.samples.TimeD6, x = logCPM),color = "chartreuse3") +
+         scale_x_continuous(name = "logCPM") +
+         scale_y_continuous(name = "logFC D0-D6") +
+         ggtitle(paste(z)) +
+         theme_bw()
+    
+  
+  return(list(DE_tags, norm_tags, P))
+}
+
+#--> Run the differential analysis for all histone modification ChIP-seq
+EdgeR_K4Me1  <- edger_batch(count_H3K4me1[[1]], RUV[[1]][[1]], "H3K4me1", 0.58)
+EdgeR_K4Me3  <- edger_batch(count_H3K4me3[[1]], RUV[[2]][[1]], "H3K4me3", 0.58)
+EdgeR_K27Ac  <- edger_batch(count_H3K27ac[[1]], RUV[[3]][[1]], "H3K27ac", 0.58)
+EdgeR_K27Me3 <- edger_batch(count_H3K27me3[[1]], RUV[[4]][[1]], "H3K27me3", 0.26)
+
+#--> MA plots
+grid.arrange(EdgeR_K4Me1[[3]], EdgeR_K4Me3[[3]],
+             EdgeR_K27Ac[[3]], EdgeR_K27Me3[[3]], nrow = 2)
+
+```
+
+# Differential analysis - SE
+
+As described before, super-enhancers were defined using ROSE with a transcription start site exclusion zone size of 5 kb and the default stitching size of 12.5 kb. H3K27ac reproducible peaks were used as input constituent enhancers, and down-sampled H3K27ac ChIP-seq signal was used for ranking the stitched regions. The identification of SE was performed independently for each time point.
+
+SE calls are then combined to define a global set of SEs used as in input for a differential analysis with DESeq2, in which we compared H3K27ac signal in original ChIP-seq replicates between every possible combination of time points to define shared and time-specific SEs.
+
+## Import data 
+
+```{r}
+library(DiffBind)
+
+#-->  Read experimental design
+sample_sheet <-  read.csv("./data/ChIP-seq/Plan_Expe_ChIP_DiffBind_SE_K27Ac.csv", sep = ";")
+  
+#-->  Create the global DBA object
+expe <- dba(sampleSheet = sample_sheet, skipLines = 0, bRemoveM = TRUE)
+expe_consensus <- dba.peakset(expe, consensus = -DBA_REPLICATE)
+expe_ol <- dba.overlap(expe_consensus,  expe_consensus$masks$Consensus)
+  
+#-->  Draw a Venn Diagramm
+D0 <- dba.peakset(expe, peaks = expe$masks$D0, consensus=-DBA_REPLICATE, bRetrieve = TRUE)
+D3 <- dba.peakset(expe, peaks = expe$masks$D3, consensus=-DBA_REPLICATE, bRetrieve = TRUE)
+D6 <- dba.peakset(expe, peaks = expe$masks$D6, consensus=-DBA_REPLICATE, bRetrieve = TRUE)
+
+#-->  Load libraries
+library(ChIPpeakAnno)
+library(eulerr)
+library(colorRamps)
+
+#-->  Format data
+ol <- findOverlapsOfPeaks(D0, D3, D6)
+venn_data <- ol$venn_cnt[,"Counts"][-1]
+names(venn_data) <- c("D6", "D3", "D3&D6", "D0", "D0&D6", "D0&D3", "D0&D3&D6")
+venn_data <- venn_data[c(4,2,1,3,5,6,7)]
+venn_p <- euler(venn_data)
+  
+#-->  Create consensus peakset
+consensus <- dba.peakset(expe, consensus = DBA_FACTOR)
+peaks <- dba.peakset(consensus, consensus$masks$ALL, bRetrieve=TRUE)
+ 
+#-->  Count binding in consensus peaks for D0 and D6
+count <- dba.count(expe,
+                     peaks = peaks,
+                     score = DBA_SCORE_READS,
+                     bLog = TRUE,
+                     fragmentSize = c(125,135,140,130,125,130,0,0,0),
+                     bParallel = TRUE)
+  
+#-->  Outputing the binding matrix containing filtered row counts
+bmatrix_se <- dba.peakset(count, bRetrieve=TRUE, DataType=DBA_DATA_FRAME)
+```
+
+## Compare pic sets
+
+```{r, fig.cap= "Comparison of super-enhancer between time points - Raw SEs", fig.height=4, fig.width=4, fig.align='center'}
+#--> Venn diagramm
+fill = list(fill = rainbow(n=6)[c(1,5,6)], alpha = 0.5)
+plot(venn_p, quantitie = TRUE, main = "SE", fills = fill)
+```
+
+## DE analysis with DESeq2
+
+```{r, fig.cap= "Comparison of super-enhancer between time points - DE SEs", fig.height=4, fig.width=4, fig.align='center', fig.wide = FALSE}
+#--> Load DESeq2 package
+library(DESeq2)
+
+#--> Creating objects for DESeq2 analysis
+data_DESeq <- bmatrix_se
+row.names(data_DESeq)  <- paste(data_DESeq[,1], data_DESeq[,2], data_DESeq[,3], sep= "_") 
+data_DESeq <- data_DESeq[, -c(1:3)]
+row.names(data_DESeq) <- NULL
+
+#--> Creating the design
+design <- data.frame(row.names = colnames(data_DESeq),
+                     Time = as.factor(c(0,0,3,3,6,6)),
+                     Replicates = as.factor(c(1,2,1,2,1,2)))
+
+DESeq_t <- DESeqDataSetFromMatrix(countData = data_DESeq,
+                                  colData = design,
+                                  design = ~  Time,
+                                  rowRanges = GRanges(peaks))
+
+#--> Running DESeq2 LRT analysis 
+ddsTC <- DESeq(DESeq_t, full = ~  Time, fitType = "parametric")
+th = .3
+
+#--> Make comparisons
+resLRT_D6_vs_D0 <- results(ddsTC, alpha = 0.1,
+                   cooksCutoff = FALSE,
+                   independentFiltering = TRUE,
+                   contrast= c("Time", "6", "0"),
+                   altHypothesis = "greater", lfcThreshold = th, format = "GRanges")
+resLRT_D6_vs_D0 <- resLRT_D6_vs_D0[which(resLRT_D6_vs_D0$padj < .1),]
+
+resLRT_D0_vs_D6 <- results(ddsTC, alpha = 0.1,
+                   cooksCutoff = FALSE,
+                   independentFiltering = TRUE,
+                   contrast= c("Time", "0", "6"),
+                   altHypothesis = "greater", lfcThreshold = th, format = "GRanges")
+resLRT_D0_vs_D6 <- resLRT_D0_vs_D6[which(resLRT_D0_vs_D6$padj < .1),]
+
+resLRT_D3_vs_D0 <- results(ddsTC, alpha = 0.1,
+                   cooksCutoff = FALSE,
+                   independentFiltering = TRUE,
+                   contrast= c("Time", "3", "0"),
+                   altHypothesis = "greater", lfcThreshold = th, format = "GRanges")
+resLRT_D3_vs_D0 <- resLRT_D3_vs_D0[which(resLRT_D3_vs_D0$padj < .1),]
+
+resLRT_D0_vs_D3 <- results(ddsTC, alpha = 0.1,
+                   cooksCutoff = FALSE,
+                   independentFiltering = TRUE,
+                   contrast= c("Time", "0", "3"),
+                   altHypothesis = "greater", lfcThreshold = th, format = "GRanges")
+resLRT_D0_vs_D3 <- resLRT_D0_vs_D3[which(resLRT_D0_vs_D3$padj < .1),]
+
+
+resLRT_D3_vs_D6 <- results(ddsTC, alpha = 0.1,
+                   cooksCutoff = FALSE,
+                   independentFiltering = TRUE,
+                   contrast= c("Time", "3", "6"),
+                   altHypothesis = "greater", lfcThreshold = th, format = "GRanges")
+resLRT_D3_vs_D6 <- resLRT_D3_vs_D6[which(resLRT_D3_vs_D6$padj < .1),]
+
+resLRT_D6_vs_D3 <- results(ddsTC, alpha = 0.1,
+                   cooksCutoff = FALSE,
+                   independentFiltering = TRUE,
+                   contrast= c("Time", "6", "3"),
+                   altHypothesis = "greater", lfcThreshold = th, format = "GRanges")
+resLRT_D6_vs_D3 <- resLRT_D6_vs_D3[which(resLRT_D6_vs_D3$padj < .1),]
+
+#--> Define the sets of time-point specific and shared SEs
+resLRT_D0_SPE <- GenomicRanges::intersect(resLRT_D0_vs_D6, resLRT_D0_vs_D3)
+resLRT_D3_SPE <- GenomicRanges::intersect(resLRT_D3_vs_D0, resLRT_D3_vs_D6)
+resLRT_D6_SPE <- GenomicRanges::intersect(resLRT_D6_vs_D0, resLRT_D6_vs_D3)
+
+COMMON_ALL <- GenomicRanges::setdiff(peaks, c(resLRT_D0_vs_D3, resLRT_D3_vs_D0,
+                               resLRT_D0_vs_D6, resLRT_D6_vs_D0,
+                               resLRT_D3_vs_D6, resLRT_D6_vs_D3))
+
+resLRT_D0_D3_COMMON <- GenomicRanges::setdiff(GenomicRanges::intersect(resLRT_D0_vs_D6, resLRT_D3_vs_D6),
+                               c(COMMON_ALL, resLRT_D0_SPE, resLRT_D3_SPE, resLRT_D6_SPE))
+resLRT_D3_D6_COMMON <- GenomicRanges::setdiff(GenomicRanges::intersect(resLRT_D3_vs_D0, resLRT_D6_vs_D0),
+                               c(COMMON_ALL, resLRT_D0_SPE, resLRT_D3_SPE, resLRT_D6_SPE))
+resLRT_D0_D6_COMMON <- GenomicRanges::setdiff(GenomicRanges::intersect(resLRT_D0_vs_D3, resLRT_D6_vs_D3),
+                               c(COMMON_ALL, resLRT_D0_SPE, resLRT_D3_SPE, resLRT_D6_SPE))
+
+#--> Venn diagramm
+venn_data <- c(length(resLRT_D6_SPE), length(resLRT_D3_SPE), length(resLRT_D3_D6_COMMON),  length(resLRT_D0_SPE),
+               length(resLRT_D0_D6_COMMON), length(resLRT_D0_D3_COMMON), length(COMMON_ALL))
+names(venn_data) <- c("D6", "D3", "D3&D6", "D0", "D0&D6", "D0&D3", "D0&D3&D6")
+venn_data <- venn_data[c(4,2,1,3,5,6,7)]
+venn_p <- euler(venn_data)
+fill = list(fill = rainbow(n=6)[c(1,5,6)], alpha = 0.5)
+plot(venn_p, quantitie = TRUE, main = "SE", fills = fill)
+
+#--> Prepare output
+all_SE_sets <- list(COMMON_ALL, resLRT_D0_SPE, resLRT_D3_SPE, resLRT_D6_SPE,
+                    resLRT_D0_D3_COMMON, resLRT_D3_D6_COMMON, resLRT_D0_D6_COMMON)
+names(all_SE_sets ) <- c("D0_D3_D6", "D0", "D3", "D6", "D0_D3", "D3_D6", "D0_D6")
+```
+
+## Super-enhancer centric H3K27ac ChIPs-seq density heatmap
+
+```{r, fig.cap= "H3K27ac ChIPs-seq density heatmap around SE ordered by H3K27ac fold-change",fig.height=6, fig.width=4, fig.align='center'}
+#--> Load libraries
+library(circlize)
+library(limma)
+library(plotrix)
+library(gplots)
+library(ComplexHeatmap)
+library(rtracklayer)
+
+#--> Get the coordinates of all SE regions
+top_sig  <- unlist(GRangesList(all_SE_sets)) 
+top_sig <- top_sig + 5000
+  
+#--> Create bins
+tile = 1000
+top_sig_split <- tile(top_sig, n = tile) # Give a GRangesList
+top_sig_split <- unlist(top_sig_split)   # Transform GRangesList to GRanges
+  
+##--> List input averages and normalized BigWig files
+bw <- list.files(path ="./data/ChIP-seq/", pattern = "H3K27ac.bw", full = TRUE)[c(3,2,1)]
+names_bw <- gsub("./data/ChIP-seq//RAS_OIS_CHIPSEQ_HISTONE_", "", bw)
+names_bw <- gsub(".bw", "", names_bw)
+  
+#--> Count signal in bins
+counts_se <- matrix(NA, nrow = length(top_sig_split), ncol = length(bw))
+colnames(counts_se) <- names_bw
+
+for(i in c(1 : length(bw))) {
+    
+  coverage <- import(bw[i], as = 'RleList')
+
+  for(chr in unique(seqnames(top_sig_split))) {
+      
+    counts_se [which(seqnames(top_sig_split) == chr) , i] <-
+      mean(Views(coverage[[chr]], ranges(top_sig_split[seqnames(top_sig_split) == chr])))
+      
+  }
+}
+
+#--> Transform into matrix
+count_top_list_se <- list()
+count_top_list_se[[1]] <- t(matrix(counts_se[,1], nrow = tile))
+count_top_list_se[[2]] <- t(matrix(counts_se[,2], nrow = tile))
+count_top_list_se[[3]] <- t(matrix(counts_se[,3], nrow = tile))
+  
+#--> Ordering according to FC
+order_se  <- order(rowSums(count_top_list_se[[1]]) / rowSums(count_top_list_se[[3]]))
+
+#--> Defining a color scheme
+library(circlize)
+library(plotrix)
+
+color <- colorRamp2(seq(from = quantile(unlist(count_top_list_se), probs = seq(0, 1, 0.05))[4],
+                        to =   quantile(unlist(count_top_list_se), probs = seq(0, 1, 0.05))[18],
+                        length.out = 30),
+                        smoothColors("#356FB2",28,"#EBE517"))
+
+
+#--> Defining annotation
+split <- NULL
+split$Sig_Change <- rep("UNCHANGED", length(top_sig))
+split$Sig_Change[which(!is.na(match(top_sig - 5000, resLRT_D0_vs_D6)))] <- "DOWN"
+split$Sig_Change[which(!is.na(match(top_sig - 5000, resLRT_D6_vs_D0)))] <- "UP"
+split_1 <- split$Sig_Change
+split_1 <- split_1[order_se]
+split_1 <- factor(split_1, levels = c("UP", "UNCHANGED", "DOWN"))
+split_2 <- ComplexHeatmap::rowAnnotation(df = data.frame(Change = split_1), 
+                           col = list(Change = c("UP" = "chartreuse3",
+                                                 "UNCHANGED" = "grey",
+                                                 "DOWN" =  "firebrick1")),
+                           width = unit(.2, "cm"))
+
+
+#--> Customized heatmap function
+heatmap_custom <- function(x, y) {
+    
+    Heatmap(x, cluster_rows = FALSE,
+            cluster_columns = FALSE,
+            col = color,
+            column_title = y,
+            gap = unit(0, "mm"),
+            combined_name_fun = NULL,
+            show_heatmap_legend = FALSE,
+            column_title_gp = gpar(fontsize = 8))
+    
+} 
+
+#--> Create ComplexHeatmap objects
+heatmap_SE <- split_2 +
+            heatmap_custom(count_top_list_se[[1]][order_se,],  names_bw[1]) +
+            heatmap_custom(count_top_list_se[[2]][order_se,],  names_bw[2]) +
+            heatmap_custom(count_top_list_se[[3]][order_se,],  names_bw[3])
+heatmap_SE
+```
+
+## Correspondance analysis
+
+To test for association between super enhancer dynamic and gene expression modules we run a correspondence analysis using the same approach as previously described. We finally characterized these different sets of super enhancers using GREAT with default parameters.
+
+```{r, fig.cap= "Z-score expression profiles for genes proximal to the different classes of SE", fig.height=7}
+#--> Input Super-Enhancers coordinates
+library(reshape)
+se <- GRanges(melt(GRangesList(all_SE_sets)))
+
+#--> Annotate Super-enhancers
+library(ChIPpeakAnno)
+se_annot <- annotatePeakInBatch(se, AnnotationData = annot_chip, output = "shortestDistance")
+mcols(se_annot) <- cbind(mcols(annot_chip[as.numeric(mcols(se_annot)$feature)]), mcols(se_annot))
+
+#--> Match SE with transcriptomic data
+library(reshape2)
+data_transcriptome <- read.table("./results/TIMECOURSE_RAS_Q_LIMMA_WGCNA.txt", header = TRUE, sep ="\t")
+se_select_transcritpome  <-  data_transcriptome[match(se_annot$mcols.gene, data_transcriptome$Gene_Symbol, nomatch = 0),]
+se_select_transcritpome <- se_select_transcritpome[-which(is.na(se_select_transcritpome$Module)),]
+
+#--> Z-score
+se_select_transcritpome[,c(2:7)] <- data.frame(t(scale(t(se_select_transcritpome[,c(2:7)]))))
+se_select_transcritpome <- data.frame(se_select_transcritpome,
+                                      SE_Type = mcols(se_annot[match(se_select_transcritpome$Gene_Symbol,
+                                                           mcols(se_annot)$mcols.gene)])$value.group_name)
+se_select_transcritpome_melt <- reshape2:::melt.data.frame(as.data.frame(se_select_transcritpome[,-c(8,9,10)]))
+colnames(se_select_transcritpome_melt) <- c( "Probe", "HGNC","UP/DOWN","Module", "SE_Type", "Day", "Exprs")
+
+#--> Plot
+colors  <- c("#FF0000", "#00B9FF", "#1430B3", "#5B03F7", "#E800FF", "#FF008B")
+
+ggplot(data = se_select_transcritpome_melt) +
+  geom_boxplot(aes(x = Day, y = Exprs, group = Day, fill = Day)) +
+  scale_fill_manual(values = colors) +
+  facet_wrap(~SE_Type, scale = "free_y", ncol = 1) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1), axis.text.y = element_text(size = 8), legend.position="none")
+```
+
+```{r, fig.cap= "Asymetric bi-plot for the correspondance analysis between SE usage and gene expression modules", fig.height=6, fig.width=6}
+#--> Correspondance analysis 
+library(FactoMineR)
+se_vs_cluster <- unique(se_select_transcritpome_melt[,c(2,4,5)])
+se_vs_cluster <- table(se_vs_cluster$SE_Type, se_vs_cluster$Module)
+ca_se_vs_cluster <- CA(se_vs_cluster, graph = FALSE)
+
+#--> Plot
+library(factoextra)
+fviz_ca_biplot(ca_se_vs_cluster, map ="rowprincipal",
+               arrow = c(FALSE, TRUE))
+
+```
+
+
+# Chromatin states analysis
+
+To track combinatorial chromatin state dynamics in space and time, we analyzed histone modification combinations with the chromstaR. Briefly, after partitioning the genome into non-overlapping bins and counting the number of reads mapping into each bin at each time point and for each histone modification, this algorithm relies on a univariate Hidden Markov Model with two hidden states (unmodified, modified). This HMM is used to fit the parameters of the two-component mixture of zero-inflated negative binomial distribution considered to model read counts for every ChIP-seq experiments. A multivariate HMM is then used to assign every bin in the genome to one of the multivariate components considering 2^(3 time points x 4 histone modifications) possible states.
+
+To limit computational burden and focus on accurate differences, the analysis is run in differential mode with a 200bp resolution, so that every mark is first analyzed separately with all conditions combined while the full combinatorial state dynamics is rebuilt by combining the differential calls obtained for the four marks.
+
+## Run chromstaR 
+
+```{r, eval = FALSE}
+#--> Load the chromstaR pacakge
+library(chromstaR)
+
+#--> Setup the environment 
+input_folder <- "./data/"
+output_folder <- "./results/STATES/"
+experiment_table <- read.table("./data/ChIP-seq/Plan_Expe_chromstaR_BAM_ALL_RAS.txt", sep = "\t", header = TRUE)
+
+# Run chromstaR in Condition mode
+Chromstar(inputfolder = input_folder,
+          experiment.table = experiment_table,
+          outputfolder = output_folder,
+          numCPU = 2,
+          mode= "differential",
+          binsize = 200,
+          eps.univariate = 0.01,
+          eps.multivariate = 0.01)
+
+#--> Refine the output
+# Load the combinedMultiHMM output
+model_cond <- get(load(file.path(Output_folder, 'combined',
+                            'combined_mode-differential.RData')))
+
+# Adjust the Cutoff to increase stringency
+cut_off <- rep(0.99999, length(model_cond$info$ID))
+names(cut_off) <- Model_Cond$info$ID
+cut_off[grep("K27Ac", names(cut_off))]  <- 0.99999
+cut_off[-grep("K27Ac", names(cut_off))] <- 0.99
+model_cond  <- changePostCutoff(model_cond , post.cutoff = cut_off)
+
+# Export the refined resutls
+exportCombinedMultivariate(model_cond, filename='Refine_2', what='peaks', separate.files=TRUE)
+```
+
+## State annotation
+
+Change in states were annotated considering annotations provided by Ensembl v86 (intergenic, promoters, CDSs, UTRs, exons, introns) and ENCODE.
+
+### Build annotation data 
+
+```{r, cache=FALSE}
+#--> Load chromstaR results
+output_folder <- "./results/STATES/"
+model_cond <- get(load(file.path(output_folder, 'combined',
+                            'combined_mode-differential_refined.RData')))
+
+library(biomaRt)
+library(plyr)
+library(reshape)
+library(ggplot2)
+library(GenomicRanges)
+
+
+#--> Build annotations for ENCODE chromatin states on lung fibroblasts
+encode_states <- read.table("./data/ChIP-seq/ENCFF604KAT.bed")
+encode_states <- split(encode_states, f = encode_states$V4)
+encode_states <- lapply(encode_states, function(x) {GRanges(seqnames = x[,1],
+                                                            IRanges(x[,2], x[,3]))})
+
+
+#--> Focus on interesting combinations
+combination_select <- c("[K27Ac]", "[K4Me3]", "[K27Ac+K4Me1]",
+                        "[K27Ac+K4Me3]", "[K27Me3+K4Me3]",
+                        "[K27Ac+K4Me1+K4Me3]","[K27Ac+K27Me3+K4Me1+K4Me3]")
+```
+
+### Positionnal enrichment / depletion of states
+
+```{r, fig.cap = "State enrichment plots around ENCODE lung fibroblast chromatin features", fig.height=20}
+#--> Load the chromstaR pacakge
+library(chromstaR)
+library(data.table)
+
+#--> Look for overlap between states and ENCODE features
+state_met_all <- NULL
+
+for (state in (names(encode_states))) {
+  
+  print(state)
+  
+  state_meta <- plotEnrichment(hmm = model_cond, region = c("start"),
+                               annotation = encode_states[[state]],
+                               bp.around.annotation= 5000, combinations = combination_select)
+  state_meta <- rbindlist(list(D0 = state_meta$D0$data,
+                             D3 = state_meta$D3$data,
+                             D6 = state_meta$D0$data),idcol = "Time")
+  state_met_all[[state]] <- state_meta
+}
+
+state_met_all_2 <- rbindlist(state_met_all, idcol = "Feature")
+
+#--> Plot
+ggplot(state_met_all_2, aes(x = lag, y = value, group = combination))  +
+  geom_smooth(aes(color = combination), size=.5, method = "glm", formula = y ~ splines::ns(x, 10), se = FALSE) +
+  facet_wrap(~Feature) +
+  scale_x_continuous(name = "log-odd score") +
+  scale_y_continuous(name = "Lag around feature") +
+  ggtitle("State enrichment plots around ENCODE lung fibroblaste chromatin features") +
+  theme_bw()
+```
+
+### Global enrichment / depletion of states
+
+```{r, fig.cap= "State enrichment heatmap for ENCODE lung fibroblast chromatin features"}
+#--> State enrichment / depletion in ENCODE features
+# Get the data
+state_enrichment <- plotFoldEnrichHeatmap(hmm = model_cond, annotation = encode_states, plot = F)
+state_enrichment_f <- data.frame(rbind(t(state_enrichment$D0)[],
+                                       t(state_enrichment$D3)[],
+                                       t(state_enrichment$D6)[]))
+state_enrichment_sum <- Reduce("+", list(t(state_enrichment$D0), t(state_enrichment$D3), t(state_enrichment$D6)))
+
+# Format
+state_enrichment_f$Time  <- rep(c("D0", "D3", "D6"), each = 16)
+state_enrichment_f$State <- rep(colnames(state_enrichment$D0), 3)
+state_enrichment_f <- melt(state_enrichment_f, value.name = "Enrichment")
+state_enrichment_f$variable <- gsub("X", "", state_enrichment_f$variable)
+state_enrichment_f$variable <- gsub("\\.", "\\/", state_enrichment_f$variable)
+
+# Clustering
+h_variable <- hclust(as.dist(1-cor(state_enrichment_sum)))$order
+h_states <- hclust(as.dist(1-cor(t(state_enrichment_sum))))$order
+state_enrichment_f$variable <- factor(state_enrichment_f$variable, levels = colnames(state_enrichment_sum)[h_variable])
+state_enrichment_f$State <- factor(state_enrichment_f$State, levels = row.names(state_enrichment_sum)[h_states])
+
+# Plot
+ggplot(data=state_enrichment_f, aes(y=State, x=variable, fill= log2(value+1), group = Time)) +
+  geom_tile(color = "black") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  scale_fill_gradientn(colours = matlab.like(c(1000))) + facet_grid(.~Time) +
+  scale_x_discrete(name = "Chromatin states - ChromstaR") +
+  scale_y_discrete(name = "Chromatin states - ChromstaR") +
+  ggtitle("State enrichment heatmap for ENCODE lung fibroblaste chromatin features")
+```
+
+## Chromatin state coverage
+
+```{r, fig.cap= "Genome-wide coverage for the different chromatin states at each time points", fig.height= 9}
+#--> Select the data
+data_state_coverage <- list(model_cond$segments.per.condition$D0,
+                            model_cond$segments.per.condition$D3, 
+                            model_cond$segments.per.condition$D6)
+
+res_state_coverage <- data.frame(Coverage_D0 = NULL, Coverage_D3 = NULL, Coverage_D6 = NULL)
+
+#--> Compute % of genome in each state at each time-point
+for (day in c(1:3)) {
+  j <- 0
+  
+  for (i in levels(data_state_coverage[[1]]$combination)) {
+    j <- j + 1
+    
+    tmp <- data_state_coverage[[day]][which(data_state_coverage[[day]]$combination == i)]
+    tmp_sum <- sum(as.numeric(width(tmp)))
+    res_state_coverage[j,day] <- tmp_sum 
+    
+  }
+}
+
+#--> Format the data
+res_state_coverage <- apply(res_state_coverage, 2, function(x) {x / sum(x) * 100})
+res_state_coverage <- data.frame(State = c(levels(data_state_coverage[[1]]$combination)), res_state_coverage)
+colnames(res_state_coverage) <- c("State", "D0", "D3", "D6")
+res_state_coverage <- melt(res_state_coverage)
+res_state_coverage$State <- factor(res_state_coverage$State,
+                                   levels = res_state_coverage[rev(order(res_state_coverage[
+                                     which(res_state_coverage[,2] == "D0"),3])),1])
+
+
+#--> Plot histogramm
+P1 <- ggplot(res_state_coverage, aes(x = State, y = value, group = variable, fill = variable)) +
+                geom_bar(width = .7, position = position_dodge(width=.8) , stat = "identity", colour="black") +
+                scale_y_sqrt(limits=c(0,100), breaks = c(0, 0.5, 1.2, 2.5, 5,10,20,40,80))+
+                scale_fill_manual(values = c("#FF0000", "#5D00FF", "#CF0D76")) +
+                theme_classic() +
+                theme(axis.text.x = element_text(angle = 90, hjust = 1), axis.text.y = element_text(size = 8))
+
+
+#--> Emission matrix
+marks <-c('K27Ac', 'K27Me3', 'K4Me1', 'K4Me3')
+emission_matrix <- dec2bin(0:(2^length(marks) - 1), colnames = marks)
+emission_matrix <- as.data.frame(emission_matrix)
+emission_matrix$combination <- apply(emission_matrix, 1, function(x) {paste(colnames(emission_matrix)[x], collapse = "+")})
+emission_matrix$combination <- paste0("[", emission_matrix$combination, "]")
+emission_matrix_2 <- reshape2::melt(emission_matrix,
+                                  variable.name = "mark",
+                                  value.name = "emission", 
+                                  id.vars = "combination")
+colnames(emission_matrix_2) <- c("combination", "mark", "emission")
+emission_matrix_2$combination <- factor(emission_matrix_2$combination, levels = levels(res_state_coverage$State))
+emission_matrix_2$mark <- factor(emission_matrix_2$mark, levels = rev(c("K4Me1", "K27Ac", "K4Me3", "K27Me3")))
+
+P2 <- ggplot(emission_matrix_2) + 
+            geom_tile(aes_string(x = "combination",  y = "mark", fill = "emission")) +
+            scale_fill_manual(values = c("white", "black")) +
+            theme_bw() + 
+            theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#--> Combine plots
+grid.arrange(P1, P2, nrow = 2, heights=c(2,1.5))
+```
+
+## Compare set of active and poised enhancers
+
+```{r, fig.keep = "none"}
+library(ChIPpeakAnno)
+library(eulerr)
+
+#--> Select the data corresponding to states
+segments_cond <- model_cond$segments
+
+#--> Define "poised enhancers" (K4me1+ or K4me1+/K4me3+) at each time point
+poised_enh <- list(D0 = reduce(c(segments_cond[which(segments_cond$combination.D0 == "[K4Me1]")],
+                                 segments_cond[which(segments_cond$combination.D0 == "[K4Me1+K4Me3]")])),
+                   D3 = reduce(c(segments_cond[which(segments_cond$combination.D3 == "[K4Me1]")],
+                                 segments_cond[which(segments_cond$combination.D3 == "[K4Me1+K4Me3]")])),
+                   D6 = reduce(c(segments_cond[which(segments_cond$combination.D6 == "[K4Me1]")],
+                                 segments_cond[which(segments_cond$combination.D6 == "[K4Me1+K4Me3]")])))
+
+poised_enh_venn <- makeVennDiagram(Peaks=poised_enh , NameOfPeaks=c("D0", "D3", "D6"), plot = FALSE)
+poised_enh_venn_2 <- c("D0" = poised_enh_venn$vennCounts[5,4],
+                       "D3" =  poised_enh_venn$vennCounts[3,4],
+                       "D6" =  poised_enh_venn$vennCounts[2,4],
+                       "D0&D6" = poised_enh_venn$vennCounts[6,4],
+                       "D0&D3" = poised_enh_venn$vennCounts[7,4],
+                       "D3&D6" = poised_enh_venn$vennCounts[4,4],
+                       "D0&D3&D6" = poised_enh_venn$vennCounts[8,4])
+names(poised_enh_venn_2) <- c("D0", "D3", "D6","D0&D6", "D0&D3", "D3&D6", "D0&D3&D6")
+venn_p_poised <- euler(poised_enh_venn_2)
+fill = list(fill = rainbow(n=6)[c(1,5,6)], alpha = 0.5)
+P1 <- plot(venn_p_poised, quantitie = TRUE, main = "SE", fills = fill)
+
+#--> Define "active enhancers" (K27ac+ or K27ac+/K4me1+ or K27ac+/K4me1+/K4me3+) at each time point
+active_enh <- list(D0 = reduce(c(segments_cond[which(segments_cond$combination.D0 == "[K27Ac]")],
+                                 segments_cond[which(segments_cond$combination.D0 == "[K27Ac+K4Me1]")],
+                                 segments_cond[which(segments_cond$combination.D0 == "[K27Ac+K4Me1+K4Me3]")])),
+                   D3 = reduce(c(segments_cond[which(segments_cond$combination.D3 == "[K27Ac]")],
+                                 segments_cond[which(segments_cond$combination.D3 == "[K27Ac+K4Me1]")],
+                                 segments_cond[which(segments_cond$combination.D3 == "[K27Ac+K4Me1+K4Me3]")])),
+                   D6 = reduce(c(segments_cond[which(segments_cond$combination.D6 == "[K27Ac]")],
+                                 segments_cond[which(segments_cond$combination.D6 == "[K27Ac+K4Me1]")],
+                                 segments_cond[which(segments_cond$combination.D6 == "[K27Ac+K4Me1+K4Me3]")])))
+
+active_enh_venn <- makeVennDiagram(Peaks=active_enh, NameOfPeaks=c("D0", "D3", "D6"), plot = FALSE)
+active_enh_venn_2 <- c("D0" = active_enh_venn$vennCounts[5,4],
+                       "D3" =  active_enh_venn$vennCounts[3,4],
+                       "D6" =  active_enh_venn$vennCounts[2,4],
+                       "D0&D6" = active_enh_venn$vennCounts[6,4],
+                       "D0&D3" = active_enh_venn$vennCounts[7,4],
+                       "D3&D6" = active_enh_venn$vennCounts[4,4],
+                       "D0&D3&D6" = active_enh_venn$vennCounts[8,4])
+names(active_enh_venn_2) <- c("D0", "D3", "D6","D0&D6", "D0&D3", "D3&D6", "D0&D3&D6")
+venn_p_active <- euler(active_enh_venn_2)
+fill = list(fill = rainbow(n=6)[c(1,5,6)], alpha = 0.5)
+P2 <- plot(venn_p_active, quantitie = TRUE, main = "SE", fills = fill)
+```
+
+```{r, fig.cap= "Evolution of active and poised enhancer sets through time"}
+#--> Combine the Venn diagramms
+grid.arrange(P1, P2, nrow =1)
+```
+
+## Export genome browser tracks
+
+```{r}
+#--> Select the data to export
+segments_export <- segments_cond
+
+#--> Associate states to mnemonics ans colors
+
+# Format the emission matrix
+row.names(emission_matrix) <- emission_matrix$combination
+emission_matrix <- emission_matrix[,-5]
+emission_matrix  <- emission_matrix[match(res_state_coverage[rev(order(res_state_coverage[which(
+                                    res_state_coverage[,2] == "D0"),3])),1], row.names(emission_matrix)),]
+
+# Associate mnemonics
+emission_matrix <- data.frame(emission_matrix,
+                      Feature = c("Unmarked",
+                                  "Polycomb_Repressed",
+                                  "Poised_Enh",
+                                  "Active_Enh",
+                                  "Active_Enh", 
+                                  "Poised_Enh",
+                                  "Active_Enh",
+                                  "Bivalent_Enh", 
+                                  "Active_TSS",
+                                  "Bivalent_TSS",
+                                  "Bivalent_TSS",
+                                  "Active_TSS",
+                                  "Bivalent_Chromatin",
+                                  "Bivalent_Enh",
+                                  "Bivalent_Enh",
+                                  "Bivalent_TSS"))
+
+# Associate colors
+emission_matrix$Color <- c("216,216,216",
+                           "84,84,84",
+                           "79,173,248",
+                           "78,113,190",
+                           "78,113,190",
+                           "79,173,248",
+                           "78,113,190",
+                           "106,154,208",
+                           "202,0,26",
+                           "239,191,45",
+                           "239,191,45",
+                           "202,0,26",
+                           "164,164,164",
+                           "106,154,208",
+                           "106,154,208",
+                           "245,195,67")
+
+        
+        
+#--> Associate chromatin bins to mnemonics and colors
+segments_export$combination.D0 <- emission_matrix[match(segments_export$combination.D0, row.names(emission_matrix)),]$Feature
+segments_export$combination.D3 <- emission_matrix[match(segments_export$combination.D3, row.names(emission_matrix)),]$Feature
+segments_export$combination.D6 <- emission_matrix[match(segments_export$combination.D6, row.names(emission_matrix)),]$Feature
+
+segments_export_D0 <- data.frame(data.frame(segments_export)[, c(1:3,8)], 0, ".", data.frame(segments_export)[, c(2:3)])
+segments_export_D3 <- data.frame(data.frame(segments_export)[, c(1:3,9)], 0, ".", data.frame(segments_export)[, c(2:3)])
+segments_export_D6 <- data.frame(data.frame(segments_export)[, c(1:3,10)], 0, ".", data.frame(segments_export)[, c(2:3)])
+
+segments_export_D0$Color <- emission_matrix[match(segments_export_D0$combination.D0, emission_matrix$Feature),]$Color
+segments_export_D3$Color <- emission_matrix[match(segments_export_D3$combination.D3, emission_matrix$Feature),]$Color
+segments_export_D6$Color <- emission_matrix[match(segments_export_D6$combination.D6, emission_matrix$Feature),]$Color
+
+write.table(segments_export_D0, "./results/STATES/BROWSERFILES/States_RAS_D0.bed",
+            quote = F, row.names = F, col.names = F, sep = "\t")
+write.table(segments_export_D3, "./results/STATES/BROWSERFILES/States_RAS_D3.bed",
+            quote = F, row.names = F, col.names = F, sep = "\t")
+write.table(segments_export_D6, "./results/STATES/BROWSERFILES/States_RAS_D6.bed",
+            quote = F, row.names = F, col.names = F, sep = "\t")
+
+```
+
+## Focus on state transitions
+
+At this stage of the analysis, we filter out differential calls not overlapping with any differential peak highlighted with edgeR. 
+
+To build the arc plot, we remove edges depicting changes occurring in less than 1% of all transitions in states between two successive time points.
+
+```{r, fig.cap= "Chromatin state transition during RAS OIS", fig.height=12}
+library(arcdiagram)
+
+#--> Define the differential fragments base on chromatin states
+segments_cond <- model_cond$segments
+diff_segment <- segments_cond[(segments_cond$combination.D0 != segments_cond$combination.D3) |
+                              (segments_cond$combination.D0 != segments_cond$combination.D6) |
+                              (segments_cond$combination.D3 != segments_cond$combination.D6)]
+
+#--> Formart differential segment (adding mnemonics)
+diff_segment_refined <- diff_segment
+diff_segment_refined$state.D0 <- emission_matrix[match(diff_segment$combination.D0,
+                                                             row.names(emission_matrix)),]$Feature
+diff_segment_refined$state.D3 <- emission_matrix[match(diff_segment$combination.D3,
+                                                             row.names(emission_matrix)),]$Feature
+diff_segment_refined$state.D6 <- emission_matrix[match(diff_segment$combination.D6,
+                                                             row.names(emission_matrix)),]$Feature
+
+diff_segment_refined <- diff_segment_refined[diff_segment_refined$differential.score >= 1]
+
+diff_segment_refined <- diff_segment_refined[
+                              (diff_segment_refined$state.D0 != diff_segment_refined$state.D3) |
+                              (diff_segment_refined$state.D0 != diff_segment_refined$state.D6) |
+                              (diff_segment_refined$state.D3 != diff_segment_refined$state.D6)]
+
+#--> Refine the differential fragments focusing on IDR ChIP-seq and ATAC-seq peaks
+goldstandard_diff <- c(import("./data/ChIP-seq/GOLDSTANDARD_ALL_DAY_ALL_MARK_IDR.bed"),
+                       import("./data/ATAC-seq/GOLDSTANDARD_ATACSEQ_ALL_DAY_IDR.bed"))
+
+# Filter segments
+diff_segment_refined <- subsetByOverlaps(diff_segment_refined, goldstandard_diff)
+
+# Output differential segments as .bed
+exportGRangesAsBedFile(diff_segment_refined ,
+                       trackname='differential_chromatin_states_IDR_cond',
+                       filename = './results/STATES/BROWSERFILES/differential_chromatin_states_IDR_cond')
+
+
+
+#--> Select segments differential between D0-D3 and D3-D6
+diff_segment_refined_D0_D3 <- diff_segment_refined[(diff_segment_refined$state.D0 !=
+                                                    diff_segment_refined$state.D3)]
+diff_segment_refined_D3_D6 <- diff_segment_refined[(diff_segment_refined$state.D3 !=
+                                                    diff_segment_refined$state.D6)]
+
+#--> Build a histogram with the most occuring transition
+top_transition <- data.frame(sort(table(paste(diff_segment_refined$state.D0,
+                              diff_segment_refined$state.D3,
+                              diff_segment_refined$state.D6)), decreasing = TRUE))
+
+colnames(top_transition) <- c("Transition", "Occurences")
+ggplot(top_transition[c(1:20),]) +
+  geom_bar(aes(x = Transition, y = Occurences), stat = "identity") +
+   coord_flip()
+  
+
+# Output differential segments as .bed
+exportGRangesAsBedFile(diff_segment_refined_D0_D3 ,
+                       trackname='differential_chromatin_states_IDR_cond_D0_D3',
+                       filename = './results/STATES/BROWSERFILES/differential_chromatin_states_IDR_cond_D0_D3')
+exportGRangesAsBedFile(diff_segment_refined_D3_D6,
+                       trackname='differential_chromatin_states_IDR_cond_D3_D6',
+                       filename = './results/STATES/BROWSERFILES/differential_chromatin_states_IDR_cond_D3_D6')
+
+#--> Build an arc plot to show transitions
+
+# Define edges
+edge_D0_D3 <- unique(data.frame(as.factor(paste("D0", diff_segment_refined$state.D0, sep = "_")),
+                                as.factor(paste("D3", diff_segment_refined$state.D3, sep = "_"))))
+
+edge_D3_D6 <- unique(data.frame(as.factor(paste("D3", diff_segment_refined$state.D3, sep = "_")),
+                                as.factor(paste("D6", diff_segment_refined$state.D6, sep = "_"))))
+
+# Compute transitions occurences
+table_edge_D0_D3 <- table(paste(diff_segment_refined$state.D0,
+                                diff_segment_refined$state.D3))
+
+table_edge_D3_D6 <- table(paste(diff_segment_refined$state.D3,
+                                diff_segment_refined$state.D6))
+
+# Format
+edge_D0_D3$Count <- table_edge_D0_D3[match(paste(gsub("D0_", "", edge_D0_D3[,1]),
+                                                 gsub("D3_", "", edge_D0_D3[,2])),
+                                           names(table_edge_D0_D3))]
+edge_D3_D6$Count <- table_edge_D3_D6[match(paste(gsub("D3_", "", edge_D3_D6[,1]),
+                                                 gsub("D6_", "", edge_D3_D6[,2])),
+                                           names(table_edge_D3_D6))]
+
+# Remove edges for steady states
+for (i in c(1:nrow(edge_D0_D3))) {
+  if (gsub("D[03]_", "",edge_D0_D3[i,1]) ==  gsub("D[03]_", "", edge_D0_D3[i,2])) {
+   edge_D0_D3[i,3] <- 0
+  }
+} 
+
+for (i in c(1:nrow(edge_D3_D6))) {
+  if (gsub("D[36]_", "", edge_D3_D6[i,1]) ==  gsub("D[36]_", "", edge_D3_D6[i,2])) {
+    edge_D3_D6[i,3] <- 0
+  }
+} 
+
+# Remove edges for changes occuring less than 1% of total transitions
+for (i in c(1:nrow(edge_D0_D3))) {
+  if ((edge_D0_D3[i,3] / sum(edge_D0_D3[,3])) * 100  < 0) {
+    edge_D0_D3[i,3] <- 0
+  }
+} 
+
+for (i in c(1:nrow(edge_D3_D6))) {
+  if ((edge_D3_D6[i,3] / sum(edge_D3_D6[,3])) * 100  < 0) {
+    edge_D3_D6[i,3] <- 0
+  }
+} 
+
+# Prepare data for the arc plot
+edge_D0_D3_tmp <- unique(matrix(as.numeric(as.factor(c(paste("D0", diff_segment_refined$state.D0, sep = "_"),
+                                        paste("D3", diff_segment_refined$state.D3, sep = "_")))), ncol = 2))
+edge_D3_D6_tmp <- unique(matrix(as.numeric(as.factor(c(paste("D3", diff_segment_refined$state.D3, sep = "_"),
+                                        paste("D6", diff_segment_refined$state.D6, sep = "_")))), ncol = 2))
+                 
+edge_D0_D3 <- cbind(edge_D0_D3, edge_D0_D3_tmp)
+edge_D3_D6 <- cbind(edge_D3_D6, edge_D3_D6_tmp)
+
+levels_D0_D3 <- unique(as.factor(c(paste("D0", diff_segment_refined$state.D0, sep = "_"),
+                                     paste("D3",diff_segment_refined$state.D3, sep = "_"))))
+levels_D3_D6 <- unique(as.factor(c(paste("D3", diff_segment_refined$state.D3, sep = "_"),
+                                     paste("D6", diff_segment_refined$state.D6, sep = "_"))))
+
+labels_D0_D3 <- c(as.character(edge_D0_D3[,4]),
+                  as.character(edge_D0_D3[,5]))
+labels_D3_D6 <- c(as.character(edge_D3_D6[,4]),
+                  as.character(edge_D3_D6[,5]))
+
+names_D0_D3 <- c(as.character(edge_D0_D3[,1]),
+                 as.character(edge_D0_D3[,2]))
+names_D3_D6 <- c(as.character(edge_D3_D6[,1]),
+                 as.character(edge_D3_D6[,2]))
+
+labels_D0_D3 <-  names_D0_D3[match(unique(c(t(as.matrix(edge_D0_D3[,c(4,5)])))), labels_D0_D3)]
+labels_D3_D6 <-  names_D3_D6[match(unique(c(t(as.matrix(edge_D3_D6[,c(4,5)])))), labels_D3_D6)]
+
+order_D0_D3 <- c("D0_Unmarked", "D0_Bivalent_TSS", "D0_Active_TSS",
+                 "D0_Poised_Enh","D0_Bivalent_Enh", "D0_Active_Enh",
+                 "D0_Bivalent_Chromatin", "D0_Polycomb_Repressed", 
+                 "D3_Unmarked", "D3_Bivalent_TSS", "D3_Active_TSS",
+                 "D3_Poised_Enh","D3_Bivalent_Enh", "D3_Active_Enh",
+                 "D3_Bivalent_Chromatin", "D3_Polycomb_Repressed")
+
+order_D3_D6 <- c("D3_Unmarked", "D3_Bivalent_TSS", "D3_Active_TSS",
+                 "D3_Poised_Enh","D3_Bivalent_Enh", "D3_Active_Enh",
+                 "D3_Bivalent_Chromatin", "D3_Polycomb_Repressed", 
+                 "D6_Unmarked", "D6_Bivalent_TSS", "D6_Active_TSS",
+                 "D6_Poised_Enh","D6_Bivalent_Enh", "D6_Active_Enh",
+                 "D6_Bivalent_Chromatin", "D6_Polycomb_Repressed")
+
+par(mfrow = c(2, 1), mar = c(10,2,2,2))
+arcplot_D0_D3 <- arcplot(as.matrix(edge_D0_D3[,c(4,5)]),
+                     lwd.arcs = edge_D0_D3$Count / (sum(edge_D0_D3$Count) + sum(edge_D3_D6$Count)) * 50,
+                     horizontal =TRUE,
+                     labels = labels_D0_D3,
+                     show.nodes=TRUE,
+                     outer = F,
+                     ordering = order_D0_D3,
+                     main = "Most occuring transitions at chromatin between T0 and 72h")
+
+arcplot_D3_D6 <- arcplot(as.matrix(edge_D3_D6[,c(4,5)]),
+                     lwd.arcs = edge_D3_D6$Count / (sum(edge_D0_D3$Count) + sum(edge_D3_D6$Count)) * 50,
+                     horizontal = TRUE,
+                     labels = labels_D3_D6 ,
+                     show.nodes=TRUE,
+                     outer = F,
+                     ordering = order_D3_D6, ,
+                     main = "Most occuring transitions at chromatin between 72h and 144h")
+```
+
+
+## Integrating chromatin state with gene expression
+
+To test for association between changes in chromatin states through time and gene expression modules we run a correspondence analysis. Briefly, genomic loci experiencing changes in chromatin states through time are first associated to the nearest gene. We then specifically focus on loci associated to genes belonging to any expression module and built a two-way contingency table summarizing the number of transition in states occurring in each expression module, further used as an input for a correspondence analysis using FactoMineR. The significance of association between the two qualitative variables (transition in state and module) are assed using a \chi^2 test. Results of the CA are visualized using a row-metric-preserving contribution asymmetric biplot.
+
+```{r, fig.cap= "Z-score expression profiles for genes proximal to different classes of transition in states"}
+#--> Load libraries
+library(ChIPpeakAnno)
+library(rtracklayer)
+
+#--> Prepare the annotation table
+annot_state <- read.table("./tools/MICROARRAY_ANNOTATION_BIOCONDUCTOR.txt", header = TRUE, sep = "\t")
+annot_state <- annot_state[-which(is.na(annot_state$Chromosome) | is.na(annot_state$Start)),]
+annot_state <- GRanges(seqnames = paste("chr", annot_state$Chromosome, sep = ""),
+                       IRanges(start = annot_state$Start, end = annot_state$Start),
+                       mcols = data.frame(probes = as.character(annot_state$Probe_ID),
+                                          gene = as.character(annot_state$HGNC_Symbol)))
+
+#--> Lift-over annotations from hg38 to hg19                 
+chain <- import.chain("./tools/hg38ToHg19.over.chain")
+seqlevels(chain) <- seqlevels(annot_state)                                        
+annot_state  <- unlist(liftOver(annot_state, chain))
+
+#--> Select the most occuring transitions
+diff_segment_selec <- diff_segment_refined
+diff_segment_selec$combination <- paste("D0_", diff_segment_selec$state.D0, "_",
+                                        "D3_", diff_segment_selec$state.D3, "_",
+                                        "D6_", diff_segment_selec$state.D6, sep = "")
+
+#--> Annotate transitions (assigning closest genes) 
+diff_segment_selec_annot <- annotatePeakInBatch(diff_segment_selec ,
+                                          AnnotationData = annot_state,
+                                          output = "nearestLocation")
+mcols(diff_segment_selec_annot) <- data.frame(mcols(diff_segment_selec_annot),  
+                                        mcols(annot_state[as.numeric(mcols(diff_segment_selec_annot)$feature)]))
+diff_segment_selec_annot$mcols.probes <- gsub("hg.1$", "hg", diff_segment_selec_annot$mcols.probes)
+
+                          
+#--> Merge with transcriptomic data
+data_transcriptome_zscore <- data.frame(Row.names = data_transcriptome[,1],
+                                        t(scale(t(data_transcriptome[,c(2:7)]))),
+                                        data_transcriptome[,c(8:13)])
+state_change_expression <- merge(data_transcriptome_zscore,
+                                 mcols(diff_segment_selec_annot),
+                                 by.x = "Row.names", by.y = "mcols.probes" )
+state_change_expression <- state_change_expression[-which(state_change_expression$Change == "STABLE"),]
+state_change_expression <- state_change_expression[,c("RAS_1_0", "RAS_1_24", "RAS_1_48",
+                                                      "RAS_1_72", "RAS_1_96","RAS_1_144",
+                                                      "Row.names", "combination")]
+colnames(state_change_expression) <- c("D0", "D1", "D2", "D3", "D4", "D6", "Probes", "Change")
+
+state_change_expression <- melt(data.frame(state_change_expression), id.vars = c("Probes", "Change"))
+colnames(state_change_expression) <- c( "Probe", "Change", "Day", "Exprs")
+state_change_expression$Combine <- paste(state_change_expression$Day,
+                                         state_change_expression$Change, sep = "_")
+
+colors  <- c("#FF0000", "#00B9FF", "#1430B3", "#5B03F7", "#E800FF", "#FF008B")
+
+select <-  names(sort(table(diff_segment_selec$combination),
+                            decreasing = TRUE)[c(1:20)])
+select <- c("D0_Active_Enh_D3_Unmarked_D6_Unmarked",
+            "D0_Active_Enh_D3_Unmarked_D6_Active_Enh",
+            "D0_Unmarked_D3_Active_Enh_D6_Active_Enh",
+            "D0_Poised_Enh_D3_Active_Enh_D6_Active_Enh")
+data <- subset(state_change_expression, is.element(state_change_expression$Change, select))
+
+data$Change <- factor(data$Change, levels = select)
+ggplot(data = data) +
+  geom_boxplot(aes(x = Day, y = Exprs, group = Day, fill = Day)) + 
+  scale_fill_manual(values = colors) +
+  facet_wrap(~Change, nrow = 2) +
+  theme_classic() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        axis.text.y = element_text(size = 8),
+        strip.text.x = element_text(size = 5),
+        legend.position="none")
+  
+
+```
+
+```{r,  fig.cap= "Asymetric bi-plot for the correspondance analysis between SE usage and gene expression modules", fig.height=6, fig.width=6}
+#--> Correspondance analysis
+state_change_module <- merge(mcols(diff_segment_selec_annot),
+                             data_transcriptome_zscore,
+                             by.x = "mcols.probes", by.y = "Row.names")
+state_change_module_table <- table(state_change_module$combination, state_change_module$Module)
+state_change_module_table <- state_change_module_table[-which(rowSums(state_change_module_table) < 50),]
+library(factoextra)
+library(FactoMineR)
+
+CA_State <- CA(state_change_module_table, graph = FALSE)
+fviz_ca_biplot(CA_State, map ="rowgreen", arrow = c(FALSE, TRUE), select.row = list(contrib = 20, cos2 = .5))
+```
+
+
+# Normalized vizualisation tracks
+
+To generate normalized viuzualisation tracks, we applied the following procedure for each histone modification :
+
+* We binned the genome in 200bp non-overlapping windows and counted reads inside each bin with `r Biocpkg("csaw")`, for each biological replicate and time point independently.
+* Bins countaining less than three reads in at least two samples were discarded.
+* The count matrix was quantile-normalized using `r Biocpkg("EDASeq")`.
+* The batch effect was further removed using `r Biocpkg("RUVSeq")`.
+* For each time point, we computed the average count obtained in each bin for the two replicates.
+* The signal was smoothed using a rolling sum in 5 consecutive windows with `r CRANpkg("zoo")`.
+* Tracks were exported as .bw using `r Biocpkg("rtracklayer")`
+
+**NB:** Since the computation of normalized tracks is intensive, the following code chunk is not evaluated and we provide already generated .bw files. To rerun the analysis, we advise to create a stand-alone R script containing the following code chunk and execute computations from the terminal using the `Rscript` command. 
+
+## Normalization script
+
+```{r, eval = FALSE}
+#--> Loading libraries
+library(GenomicAlignments)
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(biovizBase)
+library(csaw)
+library(zoo)
+library(RColorBrewer)
+library(gridExtra)
+library(RUVSeq)
+
+#--> Input arguments
+arg  <- commandArgs(TRUE)
+arg1 <- Arg[1]
+pattern <- arg1
+pattern <- paste(".*", pattern, ".*bam$", sep = "")
+bam <- list.files(path = "./data/ChIP-seq/", pattern = pattern, full = TRUE)
+bam_name_1 <- gsub("./data/ChIP-seq//RAS_OIS_CHIPSEQ_HISTONE_", "", bam)
+bam_name_2 <- gsub("_REP[12].bam", "", bam_name_1)
+
+#--> Count reads in bins
+count_1 <- windowCounts(bam.files = bam,
+                        bin = TRUE,
+                        width = 200,
+                        filter = 0,
+                        param = readParam(discard = GRanges("chrM", IRanges(1, 16571))))
+count_2 <- assay(count_1)
+colnames(count_2) <- bam_name_1
+row.names(count_2) <- c(1:nrow(count_2))
+
+#--> Remove bins with too few reads (less than 3 reads in at least 2 samples)
+zero <- apply(count_2, 1, function(x) length(x[x>3])>=2)
+count_3 <- count_2[zero,]
+count_3 <- matrix(as.numeric(unlist(count_3)),nrow=nrow(count_3))
+colnames(count_3)  <-  bam_name_1
+row.names(count_3) <- row.names(count_2)[zero]
+
+#--> Quantile normalization
+qn_counts <- betweenLaneNormalization(count_3, which = "full")
+
+#--> Remove batch effect
+type <- bam_name_1
+data_RUVs <- qn_counts
+
+set <- newSeqExpressionSet(round(data_RUVs))
+differences <- matrix(data = c(1,3,5,2,4,6), nrow = 3)
+set_RUVs <- RUVs(x = set, cIdx = row.names(set), k = 2, scIdx = differences)
+colnames(set_RUVs) <- bam_name_1
+
+#--> Generate normalization reports
+pdf(file = paste("./data/ChIP-seq/Normalization_ChIP_Report_",
+                 Arg1, ".pdf", sep = ""), width = 29.7/2, height = 21/2)
+
+  colors <- brewer.pal(6, "Set1")
+  x <- as.factor(bam_name_2)
+
+  RLE_Raw <- plotRLE(count_3, outline=FALSE, col=colors[x],
+                     main = "Relative Log Expression plot of raw counts")
+  PCA_Raw <- plotPCA(count_3, col=colors[x], cex=1.2,
+                     main = "PCA on raw counts")
+  Clust_Raw <- plot(hclust(d = as.dist(1-cor(count_3))),
+                    main = "HClust on Pearson's correlation on raw counts")
+
+  RLE_UQ <- plotRLE(qn_counts, outline=FALSE, col=colors[x],
+                    main = "Relative Log Expression plot of quantile-normalized pseucounts")
+  PCA_UQ <- plotPCA(qn_counts, col=colors[x], cex=1.2,
+                    main = "PCA on quantile-normalized pseucounts")
+  Clust_UQ <- plot(hclust(d = as.dist(1-cor(qn_counts))),
+                   main = "HClust on Pearson's correlation on quantile-normalized pseudocounts")
+
+  RLE_RUVs <- plotRLE(set_RUVs, outline=FALSE, col=colors[x],
+                      main = "Relative Log Expression plot of quantile-normalized + RUVSeq pseudocounts")
+  PCA_RUVs <- plotPCA(set_RUVs, col=colors[x], cex=1.2,
+                      main = "PCA on quantile-normalized + RUVSeq pseudocounts")
+  Clust_RUVs <- plot(hclust(d = as.dist(1-cor(normCounts(set_RUVs)))),
+                     main = "HClust on Pearson's correlation on quantile-normalized + RUVSeq pseudocounts")
+  
+dev.off()
+
+#--> Preparing output
+gr_out <-  rowRanges(count_1)
+count_final <- count_2
+count_final[as.numeric(row.names(count_3)),] <- normCounts(set_RUVs)
+
+#--> Output smoothed signal
+for (i in 1: 3) {
+  
+  print(i)
+  
+  gr_out_tmp_1 <- count_final[,2*i-1]
+  gr_out_tmp_2 <- count_final[,2*i]
+  gr_out_tmp   <- rowMeans(cbind(gr_out_tmp_1, gr_out_tmp_2))
+  
+  out <- NULL
+  
+  for (chr in seqlevels(gr_out)) {
+
+    print(chr)
+    chr_tmp <- gr_out_tmp[which(seqnames(gr_out) == chr )]
+    chr_tmp <- rollapply(chr_tmp , width = 5, by = 1, FUN = sum, partial = TRUE)
+    out <- c(out, chr_tmp)
+  }
+  
+  gr_out_final <- gr_out
+  score(gr_out_final) <- out
+
+  name <- paste("./data/ChIP-seq/", "RAS_OIS_CHIPSEQ_HISTONE_", bam_name_2[2*i-1], ".bw", sep = "")
+  export.bw(gr_out_final, name)
+}
+```
+
+## Examples
+
+### Prepare the Gviz session
+
+```{r}
+#--> Loading libraries
+library(Gviz)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+library(org.Hs.eg.db)
+
+#--> Define the GenomeAxis layout
+g_axe <- GenomeAxisTrack(col="black")
+
+#--> Define the GeneRegion characteristics
+g_reg <- BiomartGeneRegionTrack(genome = "hg19")
+
+#--> List histone ChIP-seq normalized signal tracks
+samples_chip <- list.files("./data/ChIP-seq/",
+                        pattern = "bw",
+                        full.names = TRUE)
+
+names <- gsub("./data/ChIP-seq//RAS_OIS_CHIPSEQ_HISTONE_|.bw", "", samples_chip)
+
+#--> Create DataTrack for each samples
+colors  <- c("#FD8800", "#8FBD00", "#BA008C", "#076EA0")
+type <- "histogram"
+
+s1 <- DataTrack(samples_chip[1], name = names[1], ylim = c(0,150), type = type, col.histogram= colors[1])
+s2 <- DataTrack(samples_chip[2], name = names[2], ylim = c(0,100), type = type, col.histogram = colors[2])
+s3 <- DataTrack(samples_chip[3], name = names[3], ylim = c(0,75), type = type, col.histogram = colors[3])
+s4 <- DataTrack(samples_chip[4], name = names[4], ylim = c(0,250), type = type, col.histogram = colors[4])
+s5 <- DataTrack(samples_chip[5], name = names[5], ylim = c(0,150), type = type, col.histogram = colors[1])
+s6 <- DataTrack(samples_chip[6], name = names[6], ylim = c(0,100), type = type, col.histogram = colors[2])
+s7 <- DataTrack(samples_chip[7], name = names[7], ylim = c(0,75), type = type, col.histogram = colors[3])
+s8 <- DataTrack(samples_chip[8], name = names[8], ylim = c(0,250), type = type, col.histogram = colors[4])
+s9 <- DataTrack(samples_chip[9], name = names[9], ylim = c(0,150), type = type, col.histogram = colors[1])
+s10 <- DataTrack(samples_chip[10], name = names[10], ylim = c(0,100), type = type, col.histogram = colors[2])
+s11 <- DataTrack(samples_chip[11], name = names[11], ylim = c(0,75), type = type, col.histogram = colors[3])
+s12 <- DataTrack(samples_chip[12], name = names[12], ylim = c(0,250), type = type, col.histogram = colors[4])
+
+samples <- list(s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12)
+samples <- samples[c(11,7,3, 9,5,1, 12,8,4, 10,6,2)]
+```
+
+### Example at the Mb scale
+
+```{r, fig.cap="Normalized profiles of H3K4me1, H3K27ac, H3K4me3 and H3K27me3 ChIP-seq signal in a 50 mega base-pair (Mb) region located on chromosome 2"}
+#--> Define the region of interest
+region <- GRanges("chr2", IRanges(112000000,116000000))
+
+#--> Setup the chromosome ideogram
+ideo <- IdeogramTrack(genome = "hg19",
+                      chromosome = as.character(seqnames(region)))
+
+#--> Plot
+plotTracks(c(samples, ideo),
+           sizes=c(rep(1,12),1),
+           from = as.numeric(start(region)),
+           to = as.numeric(end(region)),
+           chromosome = as.character(seqnames(region)))
+```
+
+### Examples of de novo enhancers
+
+```{r,fig.cap="Normalized profiles of H3K4me1, H3K27ac, H3K4me3 and H3K27me3 ChIP-seq signal in the TNSF15 locus"}
+#--> Define the region of interest
+region <- GRanges("chr9", IRanges(117641891,117644303))
+
+#--> Setup the highlight
+hl <- HighlightTrack(trackList = samples, 
+                     start = as.numeric(start(region)),
+                     end = as.numeric(end(region)),
+                     chromosome = as.character(seqnames(region)))
+
+#--> Setup the chromosome ideogram
+ideo <- IdeogramTrack(genome = "hg19",
+                      chromosome = as.character(seqnames(region )))
+
+#--> Plot
+plotTracks(c(hl, g_reg, ideo),
+           sizes=c(rep(1,12),1, 1),
+           from = as.numeric(start(region)) - 50000,
+           to = as.numeric(end(region)) + 50000,
+           chromosome = as.character(seqnames(region)), shape = "arrow",
+           transcriptAnnotation = "symbol", collapseTranscripts = "meta")
+
+```
+
+```{r,fig.cap="Normalized profiles of H3K4me1, H3K27ac, H3K4me3 and H3K27me3 ChIP-seq signal in the IL1B locus"}
+#--> Define the region of interest
+region <- GRanges("chr2", IRanges(113575579,113582364))
+
+#--> Setup the highlight
+hl <- HighlightTrack(trackList = samples, 
+                     start = as.numeric(start(region)),
+                     end = as.numeric(end(region)),
+                     chromosome = as.character(seqnames(region)))
+
+#--> Setup the chromosome ideogram
+ideo <- IdeogramTrack(genome = "hg19",
+                      chromosome = as.character(seqnames(region )))
+
+#--> Plot
+plotTracks(c(hl, g_reg, ideo),
+           sizes=c(rep(1,12),1, 1),
+           from = as.numeric(start(region)) - 100000,
+           to = as.numeric(end(region)) + 100000,
+           chromosome = as.character(seqnames(region)), shape = "arrow",
+           transcriptAnnotation = "symbol", collapseTranscripts = "meta")
+
+
+```
+
+### Examples of repressed enhancers
+
+```{r,fig.cap="Normalized profiles of H3K4me1, H3K27ac, H3K4me3 and H3K27me3 ChIP-seq signal in the IL1B locus"}
+
+state_change_expression [which(state_change_expression $state.D0 == "Active_Enh" &
+     state_change_expression$state.D3 == "Unmarked" &
+      state_change_expression$state.D6 == "Unmarked" &
+      state_change_expression$Change == "DOWN")]
+
+#--> Define the region of interest
+region <- GRanges("chr6", IRanges(2427901,2428500)) #POU2F5
+region <- GRanges("chr6", IRanges(20376201,20376900)) #E2F3
+region <- GRanges("chr1", IRanges(218490401, 218490500)) #TGFB2 
+region <- GRanges("chr10", IRanges(104802601, 104845800)) #NT5C2
+
+region <- state_change_expression [which(state_change_expression $state.D0 == "Active_Enh" &
+     state_change_expression$state.D3 == "Unmarked" &
+      state_change_expression$state.D6 == "Unmarked" &
+      state_change_expression$Change == "DOWN")][i]
+#--> Setup the highlight
+hl <- HighlightTrack(trackList = c(samples,atac), 
+                     start = as.numeric(start(region)),
+                     end = as.numeric(end(region)),
+                     chromosome = as.character(seqnames(region)))
+
+#--> Setup the chromosome ideogram
+ideo <- IdeogramTrack(genome = "hg19",
+                      chromosome = as.character(seqnames(region )))
+
+#--> Plot
+plotTracks(c(hl, g_reg, ideo),
+           sizes=c(rep(1,18),1, 1),
+           from = as.numeric(start(region)) - 20000,
+           to = as.numeric(end(region)) + 20000,
+           chromosome = as.character(seqnames(region)), shape = "arrow",
+           transcriptAnnotation = "symbol", collapseTranscripts = "meta")
+
+t <- read.table("./results/STATES/BROWSERFILES/States_RAS_D0.bed")
+colnames(t) <- c("chr", "start", "end", "State", "zero", "start2", "end2","color")
+t <- as(t, "GRanges")
+hmmTrack <- AnnotationTrack(t, start = from,  end = to, id = t$State, width = 10, genome="hg19", stacking = "dense", feature = t$color, name = "t")
+```
+
+
+# Session Info
+
+```{r, eval = TRUE, results = 'markup', message = TRUE, echo = TRUE,}
+sessionInfo()
+```
